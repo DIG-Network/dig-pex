@@ -1,0 +1,51 @@
+# dig-pex — the DIG Peer Exchange (PEX) protocol for the DIG Node peer network.
+#
+# PEX lets a participant that already holds an AUTHENTICATED link to another participant tell it,
+# incrementally, which peers it knows FIRST-HAND — so the network's address books stay warm without
+# polling and without a central directory. It adapts BitTorrent PEX (`ut_pex`): bounded periodic
+# `added`/`dropped` deltas over an established connection, hard per-message caps, and NO third-party
+# re-flooding (an entry learned via PEX is never re-advertised until independently verified).
+#
+# Dependency philosophy (mirrors dig-dht / dig-nat): keep the tree SMALL and the engine SANS-IO. The
+# `PexEngine` is transport-agnostic — you feed it link events, decoded messages, local peer-set
+# changes, and clock ticks, and it returns the messages to send + the events to act on; the node and
+# relay do the actual dig-nat / WebSocket I/O. So the whole protocol — the wire, caps, timing, the
+# per-direction state machine, per-link told-state, provenance/first-hand tracking — is tested over
+# IN-MEMORY links (NO real network).
+#
+# The peer entry carries a STANDALONE `PeerEntry` (its own `host`/`port`/`kind` address shape) that
+# is BYTE-COMPATIBLE with the L7 `dig.getPeers` `PeerRecord` and the dig-nat / dig-gossip / dig-dht
+# `Contact` address shape (same JSON field names + `kind` tokens) — mirrored here rather than pulling
+# those crates in, so PEX keeps a minimal dependency surface. See `entry.rs`.
+[package]
+name = "dig-pex"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+license = "Apache-2.0 OR MIT"
+description = "Peer Exchange (PEX) for the DIG Node peer network — delta-based first-hand known-peer exchange over already-authenticated links (node<->node dig-nat mux, relay->node RLY-008 WebSocket), in the spirit of BitTorrent PEX: periodic added/dropped deltas, hard per-message caps, receiver-enforced minimum interval anti-flood floor, and no third-party re-flooding. Ships a transport-agnostic sans-IO PexEngine embedded by dig-node and dig-relay."
+repository = "https://github.com/DIG-Network/dig-pex"
+readme = "README.md"
+keywords = ["pex", "peer-exchange", "p2p", "gossip", "dig"]
+categories = ["network-programming"]
+
+[dependencies]
+# The PEX wire: four `type`-tagged JSON messages, framed as a u32-BE length prefix + JSON body on the
+# byte-stream binding (byte-identical to the dig-nat / dig-dht wires) and as a bare JSON text frame on
+# the relay WebSocket binding.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime — only the wire `decode` (reading a framed message off an `AsyncRead`) is async; the
+# `PexEngine` itself is fully synchronous / sans-IO.
+tokio = { version = "1", features = ["rt", "macros", "io-util"] }
+
+# Additive send jitter (0..+10% of the effective interval) to decorrelate network-wide cadence ticks.
+rand = "0.8"
+
+[dev-dependencies]
+# `#[tokio::test]` for the async framing round-trips; `Cursor` drives decode with no real network.
+tokio = { version = "1", features = ["rt", "macros", "io-util"] }
+
+[profile.release]
+overflow-checks = true
