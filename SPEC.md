@@ -310,6 +310,23 @@ A receiver MUST enforce a minimum inter-arrival time on data messages, per direc
 A sender receiving `pex_error` code `3` SHOULD double its effective interval on that link
 (capped at `PEX_MAX_INTERVAL`).
 
+`pex_error` is advisory and **unauthenticated** — any non-muted peer can send one at will (§4.5,
+§11.1) — so a sender MUST bound how far/fast an unearned code-3 can push its own cadence:
+
+- **Plausibility gate:** a sender MUST only apply the back-off if it has itself sent a data
+  message to that peer within the receiver's arrival-floor window — i.e. `now` is within `floor`
+  seconds (per this section's `floor` definition, evaluated against the sender's OWN
+  `self_interval_secs`) of `last_data_send_ms` on that link. A code-3 arriving outside that window
+  cannot correspond to a real violation of the sender's own sends and MUST be ignored (the
+  interval is left unchanged).
+- **Rate limit:** even a plausible code-3 MUST be honored at most once per (pre-doubling)
+  effective interval on that link. A burst of further code-3 frames arriving before that interval
+  elapses again MUST NOT re-apply the doubling — so a peer flooding code-3 cannot ratchet the
+  interval toward `PEX_MAX_INTERVAL` faster than one genuine violation could.
+
+Together these bound a spoofed code-3 to, at most, one doubling per interval the sender could
+plausibly have violated — never an unbounded or immediate escalation to `PEX_MAX_INTERVAL`.
+
 ## 7 · Caps & validation
 
 ### 7.1 Constants (frozen for version 1)
@@ -551,6 +568,7 @@ The frozen, testable statements of version 1. An implementation conforms iff all
 | PEX-13 | Relay binding (RLY-008): purely additive to RLY-001..RLY-007; gated on the node's `pex_handshake` after registration; relay entries are registration-backed with `via:"introducer"`; node-sent data messages never enter the introducer registry. |
 | PEX-14 | The error envelope is `pex_error` with the §4.5 code table, on both bindings; errors are advisory. |
 | PEX-15 | The per-link `received` set is capped at `PEX_MAX_RECEIVED_PER_LINK` and the global `hints` map at `PEX_MAX_HINTS`, both with oldest-`last_seen` eviction on overflow; muting a direction immediately clears its `received` set and any `hints` it sources. |
+| PEX-16 | A `pex_error` code-3 back-off is applied only when the sender's own last data send on that link falls within the receiver's arrival-floor window of `now`, and at most once per (pre-doubling) effective interval — an unauthenticated code-3 flood cannot force an unbounded or immediate escalation to `PEX_MAX_INTERVAL`. |
 
 Cross-references: the L7 peer-network page (`docs.dig.net` → protocol → peer-network) defines the
 `peer_id`, the address/`Contact` shapes, RLY-001..RLY-007, and the framed-JSON convention this

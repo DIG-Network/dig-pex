@@ -57,6 +57,12 @@ pub struct LinkState {
     /// Our own declared interval (seconds) for this link — starts at the configured value and MAY
     /// double on receiving `pex_error` code `3` (SPEC §6.4), capped at `PEX_MAX_INTERVAL`.
     pub self_interval_secs: u32,
+    /// When a `pex_error` code-3 back-off was last actually applied to `self_interval_secs`, in
+    /// `now_ms` (LOW #179 fix). Bounds how often an unauthenticated `pex_error` can move our send
+    /// cadence: a further code-3 is honored at most once per (pre-doubling) effective interval, so a
+    /// peer spamming code-3 cannot ratchet the interval to `PEX_MAX_INTERVAL` faster than a single
+    /// genuine violation could.
+    pub last_backoff_applied_ms: Option<u64>,
 
     // ---- receiver (incoming) direction ----
     /// The inbound state machine (SPEC §5.3).
@@ -86,6 +92,7 @@ impl LinkState {
             last_data_send_ms: None,
             send_jitter_ms: 0,
             self_interval_secs,
+            last_backoff_applied_ms: None,
             phase: RecvPhase::AwaitingHandshake,
             remote_declared_secs: None,
             last_arrival_ms: None,
@@ -117,6 +124,7 @@ mod tests {
         assert!(l.told.is_empty());
         assert!(l.received.is_empty());
         assert_eq!(l.self_interval_secs, 60);
+        assert_eq!(l.last_backoff_applied_ms, None);
     }
 
     #[test]

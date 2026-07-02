@@ -325,7 +325,8 @@ fn code3_error_backs_off_the_senders_interval() {
     let mut a = engine(&hex(0x0a), "mainnet");
     a.link_up(&hex(0x0b), 1_000_000);
     a.upsert_known(entry(&hex(0x0c), "mainnet", 1000));
-    // Receiving a rate-violation error doubles our effective interval: 60 → 120 s.
+    // Receiving a rate-violation error doubles our effective interval: 60 → 120 s. Our own send
+    // (link_up, above) was at the same now_ms, so it is plausible we actually violated the floor.
     a.on_message(
         &hex(0x0b),
         PexMessage::PexError {
@@ -342,6 +343,84 @@ fn code3_error_backs_off_the_senders_interval() {
         a.tick(1_120_000).len(),
         1,
         "the doubled 120 s interval now elapsed"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// LOW (#179) — a spoofed pex_error code 3 must not force an unbounded/indefinite back-off: it is
+// only honored when we could plausibly have violated the floor, and at most once per effective
+// interval even from a genuinely-violating peer.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn code3_error_is_ignored_when_we_never_plausibly_violated_the_floor() {
+    let mut a = engine(&hex(0x0a), "mainnet");
+    // link_up at t=0 sends our snapshot (our only send so far). The arrival floor for a 60s
+    // interval is (60-5)=55s, so a real rate violation on OUR sends could only be claimed while
+    // within 55s of that send. A code-3 arriving long after (well past the floor window, and long
+    // before our next legitimate send at t=60s) cannot correspond to a real violation.
+    a.link_up(&hex(0x0b), 0);
+
+    // Spoofed code-3 arrives at t=56s: past the 55s arrival-floor window since our last (and only)
+    // send, so it is not plausible we actually violated anything.
+    a.on_message(
+        &hex(0x0b),
+        PexMessage::PexError {
+            code: 3,
+            message: "rate violation".into(),
+        },
+        56_000,
+    );
+
+    // The interval must be unaffected: tick at exactly 60s must still fire (not pushed to 120s).
+    a.upsert_known(entry(&hex(0x0c), "mainnet", 1000));
+    assert_eq!(
+        a.tick(60_000).len(),
+        1,
+        "an un-doubled 60s interval must have already elapsed by t=60s"
+    );
+}
+
+#[test]
+fn repeated_code3_spam_backs_off_at_most_once_per_effective_interval() {
+    let mut a = engine(&hex(0x0a), "mainnet");
+    a.link_up(&hex(0x0b), 1_000_000);
+    a.upsert_known(entry(&hex(0x0c), "mainnet", 1000));
+
+    // First code-3 (plausible: arrives right after our send) legitimately doubles 60 -> 120.
+    a.on_message(
+        &hex(0x0b),
+        PexMessage::PexError {
+            code: 3,
+            message: "rate violation".into(),
+        },
+        1_000_000,
+    );
+    // A flood of further code-3 frames arriving immediately after must NOT keep doubling
+    // (120 -> 240 -> 480 -> ... -> 3600) — at most one back-off per effective interval.
+    for _ in 0..10 {
+        a.on_message(
+            &hex(0x0b),
+            PexMessage::PexError {
+                code: 3,
+                message: "rate violation".into(),
+            },
+            1_000_001,
+        );
+    }
+
+    // If the spam had kept doubling, the interval would have hit PEX_MAX_INTERVAL (3600s) and a
+    // tick at 1_000_000 + 130_000 (just past the legitimate single-doubling 120s) would stay
+    // silent far longer than 120s. Assert the single doubling (120s), not runaway growth: a tick
+    // just past 120s must fire.
+    assert!(
+        a.tick(1_000_000 + 119_000).is_empty(),
+        "119s < the single doubled 120s interval"
+    );
+    assert_eq!(
+        a.tick(1_000_000 + 121_000).len(),
+        1,
+        "121s > the single doubled 120s interval — spam must not have pushed it further"
     );
 }
 

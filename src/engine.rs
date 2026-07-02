@@ -260,7 +260,7 @@ impl PexEngine {
         }
 
         match msg {
-            PexMessage::PexError { code, .. } => self.on_pex_error(peer_id, code),
+            PexMessage::PexError { code, .. } => self.on_pex_error(peer_id, code, now_ms),
             PexMessage::PexHandshake {
                 version,
                 network_id,
@@ -408,12 +408,34 @@ impl PexEngine {
 
     /// `pex_error` is acceptable in any state and never changes the receiver state (SPEC §5.3). A
     /// sender receiving code `3` SHOULD back off — double its effective interval, capped (SPEC §6.4).
-    fn on_pex_error(&mut self, peer_id: &str, code: u16) -> PexOutcome {
+    ///
+    /// `pex_error` is advisory and **unauthenticated** (SPEC §4.5): any non-muted peer can send it at
+    /// will. Two gates bound how far/fast a spoofed code-3 flood can push us (LOW #179 fix):
+    ///
+    /// 1. **Plausibility** — only honored if we actually sent a data message to this peer recently
+    ///    enough that a rate violation is plausible: `now_ms` must fall within
+    ///    `arrival_floor_ms(self_interval_secs)` of `last_data_send_ms`. A code-3 arriving long after
+    ///    our last send (or before we have ever sent anything) cannot correspond to a real violation
+    ///    of *our* sends, so it is ignored.
+    /// 2. **Rate limit** — even a plausible code-3 is honored at most once per (pre-doubling)
+    ///    effective interval: a flood of code-3 frames right after a legitimate one cannot keep
+    ///    doubling toward `PEX_MAX_INTERVAL` faster than one genuine violation could.
+    fn on_pex_error(&mut self, peer_id: &str, code: u16, now_ms: u64) -> PexOutcome {
         if code == PexErrorCode::RateViolation.as_u16() {
             if let Some(link) = self.links.get_mut(peer_id) {
-                link.self_interval_secs = clamp_interval(
-                    (link.self_interval_secs.saturating_mul(2)).min(PEX_MAX_INTERVAL),
-                );
+                let plausible = link.last_data_send_ms.is_some_and(|sent| {
+                    now_ms.saturating_sub(sent) < arrival_floor_ms(link.self_interval_secs)
+                });
+                let effective_ms = u64::from(link.self_interval_secs) * 1000;
+                let rate_limited = link
+                    .last_backoff_applied_ms
+                    .is_some_and(|applied| now_ms.saturating_sub(applied) < effective_ms);
+                if plausible && !rate_limited {
+                    link.self_interval_secs = clamp_interval(
+                        (link.self_interval_secs.saturating_mul(2)).min(PEX_MAX_INTERVAL),
+                    );
+                    link.last_backoff_applied_ms = Some(now_ms);
+                }
             }
         }
         PexOutcome::default()
