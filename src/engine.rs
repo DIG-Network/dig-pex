@@ -137,6 +137,20 @@ pub struct PexEngine {
     links: HashMap<String, LinkState>,
     /// Global inbound dedup (SPEC §9.2): `peer_id → current best hint`.
     hints: HashMap<String, ReceivedHint>,
+    /// Bumped on every `known` mutation ([`upsert_known`](Self::upsert_known) /
+    /// [`remove_known`](Self::remove_known)) — invalidates `advertisable_cache` (#179 MED
+    /// optimization: the freshest-first, self-excluded base list is identical across every link
+    /// within one tick, so it is computed once and reused rather than per-link).
+    known_epoch: u64,
+    /// The cached partner-independent advertisable base list (self excluded, stale dropped,
+    /// freshest-first) — `(epoch it was built at, the `now_secs` it was built for, the list)`.
+    /// Recomputed only when `known_epoch` or `now_secs` has moved since the cached build.
+    advertisable_cache: std::cell::RefCell<Option<(u64, u64, Vec<PeerEntry>)>>,
+    /// Test-only instrumentation (#179 MED): counts actual `advertisable_base` rebuilds, so a test
+    /// can assert the cache is hit (O(1) rebuild per tick) rather than only checking behavioral
+    /// equivalence, which a naive per-link recompute would also satisfy.
+    #[cfg(test)]
+    advertisable_rebuilds: std::cell::Cell<u64>,
 }
 
 impl PexEngine {
@@ -148,6 +162,10 @@ impl PexEngine {
             known: HashMap::new(),
             links: HashMap::new(),
             hints: HashMap::new(),
+            known_epoch: 0,
+            advertisable_cache: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            advertisable_rebuilds: std::cell::Cell::new(0),
         }
     }
 
@@ -163,12 +181,14 @@ impl PexEngine {
             return;
         }
         self.known.insert(entry.peer_id.clone(), entry);
+        self.known_epoch = self.known_epoch.wrapping_add(1);
     }
 
     /// Remove a peer from the advertise set — it disconnected or went stale (SPEC §9.3). It surfaces
     /// as `dropped` in the next delta on links that were told it.
     pub fn remove_known(&mut self, peer_id: &str) {
         self.known.remove(peer_id);
+        self.known_epoch = self.known_epoch.wrapping_add(1);
     }
 
     // ----- link lifecycle (SPEC §5) -----
@@ -187,9 +207,10 @@ impl PexEngine {
         };
 
         // Build the snapshot from the current advertisable set (freshest-first, capped, self+partner
-        // excluded) before mutating the link, so `known` isn't borrowed across the link mutation.
+        // excluded) before mutating the link, so `known` isn't borrowed across the link mutation. Uses
+        // the same cached partner-independent base as `tick`'s deltas (#179 MED optimization).
         let now_secs = now_ms / 1000;
-        let mut peers = advertisable(&self.known, &self.cfg.local_peer_id, peer_id, now_secs);
+        let mut peers = self.advertisable_for(peer_id, now_secs);
         peers.truncate(PEX_MAX_SNAPSHOT);
 
         let remote_declared = self.links.get(peer_id).and_then(|l| l.remote_declared_secs);
@@ -643,18 +664,19 @@ fn evict_oldest<V>(map: &mut HashMap<String, V>, last_seen: impl Fn(&V) -> u64) 
     }
 }
 
-/// The advertisable subset of `known` for a link to `partner` at `now_secs`: self + partner excluded
-/// (SPEC §5.4), stale entries dropped (SPEC §8.2), sorted **freshest-first** then by `peer_id` for a
-/// deterministic order (SPEC §4.3, §9.1).
-fn advertisable(
+/// The **partner-independent** advertisable base for `known` at `now_secs`: self excluded (SPEC
+/// §5.4), stale entries dropped (SPEC §8.2), sorted **freshest-first** then by `peer_id` for a
+/// deterministic order (SPEC §4.3, §9.1). This ordering is identical for every link in a given tick
+/// (only the partner exclusion differs per link) — see [`PexEngine::advertisable_for`], which caches
+/// this and applies the cheap per-link partner exclusion (#179 MED optimization).
+fn advertisable_base(
     known: &HashMap<String, PeerEntry>,
     local_peer_id: &str,
-    partner: &str,
     now_secs: u64,
 ) -> Vec<PeerEntry> {
     let mut out: Vec<PeerEntry> = known
         .values()
-        .filter(|e| e.peer_id != local_peer_id && e.peer_id != partner)
+        .filter(|e| e.peer_id != local_peer_id)
         .filter(|e| {
             // Not stale: within PEX_MAX_ENTRY_AGE (a future last_seen is treated as fresh).
             e.last_seen >= now_secs || now_secs - e.last_seen <= crate::caps::PEX_MAX_ENTRY_AGE
@@ -670,17 +692,63 @@ fn advertisable(
 }
 
 impl PexEngine {
+    /// The partner-independent advertisable base list for `now_secs`, computed once and reused for
+    /// every link (#179 MED optimization): freshest-first, self excluded, stale dropped. Cached in
+    /// `advertisable_cache` and only recomputed when `known_epoch` (bumped by
+    /// [`upsert_known`](Self::upsert_known)/[`remove_known`](Self::remove_known)) or `now_secs` has
+    /// moved since the cached build — so `L` links in one `tick` share a single O(K log K) build
+    /// instead of each paying it, where `K = known.len()`.
+    fn advertisable_cached(&self, now_secs: u64) -> std::cell::Ref<'_, Vec<PeerEntry>> {
+        {
+            let cache = self.advertisable_cache.borrow();
+            if let Some((epoch, cached_secs, _)) = cache.as_ref() {
+                if *epoch == self.known_epoch && *cached_secs == now_secs {
+                    drop(cache);
+                    return std::cell::Ref::map(self.advertisable_cache.borrow(), |c| {
+                        &c.as_ref().unwrap().2
+                    });
+                }
+            }
+        }
+        let fresh = advertisable_base(&self.known, &self.cfg.local_peer_id, now_secs);
+        #[cfg(test)]
+        self.advertisable_rebuilds
+            .set(self.advertisable_rebuilds.get() + 1);
+        *self.advertisable_cache.borrow_mut() = Some((self.known_epoch, now_secs, fresh));
+        std::cell::Ref::map(self.advertisable_cache.borrow(), |c| &c.as_ref().unwrap().2)
+    }
+
+    /// Test-only: how many times the advertisable base list has actually been rebuilt (#179 MED) —
+    /// used to assert the per-tick cache is hit rather than recomputed per link.
+    #[cfg(test)]
+    fn advertisable_rebuild_count(&self) -> u64 {
+        self.advertisable_rebuilds.get()
+    }
+
+    /// The advertisable subset for a link to `partner` at `now_secs`: the cached partner-independent
+    /// base (see [`advertisable_cached`](Self::advertisable_cached)) with `partner` excluded (SPEC
+    /// §5.4) cheaply during iteration — no additional clone or sort of the shared list.
+    fn advertisable_for(&self, partner: &str, now_secs: u64) -> Vec<PeerEntry> {
+        self.advertisable_cached(now_secs)
+            .iter()
+            .filter(|e| e.peer_id != partner)
+            .cloned()
+            .collect()
+    }
+
     /// Compute the delta for a link relative to its told-state (SPEC §9.1): `added` = advertisable
     /// entries not yet told (or told with a changed fingerprint), freshest-first, capped at
     /// [`PEX_MAX_ADDED`]; `dropped` = told ids no longer advertisable, capped at [`PEX_MAX_DROPPED`].
     fn build_delta(&self, peer_id: &str, now_secs: u64) -> (Vec<PeerEntry>, Vec<String>) {
         let link = &self.links[peer_id];
-        let advert = advertisable(&self.known, &self.cfg.local_peer_id, peer_id, now_secs);
+        let base = self.advertisable_cached(now_secs);
 
         let mut added = Vec::new();
-        for e in &advert {
+        let mut advert_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for e in base.iter().filter(|e| e.peer_id != peer_id) {
+            advert_ids.insert(e.peer_id.as_str());
             if added.len() >= PEX_MAX_ADDED {
-                break;
+                continue; // keep collecting ids for the dropped-set below; added is already capped
             }
             match link.told.get(&e.peer_id) {
                 Some(fp) if *fp == e.fingerprint() => {} // unchanged — never re-advertise (SPEC §9.1)
@@ -688,8 +756,6 @@ impl PexEngine {
             }
         }
 
-        let advert_ids: std::collections::HashSet<&str> =
-            advert.iter().map(|e| e.peer_id.as_str()).collect();
         let mut dropped = Vec::new();
         for id in link.told.keys() {
             if dropped.len() >= PEX_MAX_DROPPED {
@@ -835,5 +901,110 @@ mod cap_tests {
             e.current_hint(&hex_id(2)).is_none(),
             "hints sourced from a now-muted link must be cleared"
         );
+    }
+}
+
+#[cfg(test)]
+mod advertisable_cache_tests {
+    use super::*;
+    use crate::entry::{Address, Provenance};
+
+    fn hex_id(n: u32) -> String {
+        format!("{n:064x}")
+    }
+
+    fn eng(local: &str) -> PexEngine {
+        PexEngine::new(PexConfig::new(local.to_string(), "mainnet".to_string()).with_jitter(false))
+    }
+
+    fn known_entry(n: u32, last_seen: u64) -> PeerEntry {
+        PeerEntry::new(hex_id(n), "mainnet", last_seen, Provenance::Direct)
+            .with_address(Address::direct("203.0.113.7", 9444))
+    }
+
+    /// MEDIUM finding (#179): a single `tick` covering many links must build the partner-independent
+    /// advertisable base list ONCE and reuse it across every link, not clone+re-sort per link.
+    #[test]
+    fn tick_rebuilds_advertisable_base_once_for_many_links() {
+        let mut e = eng(&hex_id(0));
+        for n in 100..110 {
+            e.upsert_known(known_entry(n, 1_000));
+        }
+        for n in 0..20u32 {
+            e.link_up(&hex_id(n), 1_000_000);
+        }
+        // link_up itself uses the cache; each link_up call is at the SAME now_secs, so all 20 share
+        // one rebuild.
+        assert_eq!(
+            e.advertisable_rebuild_count(),
+            1,
+            "20 link_ups at the same now_secs must share a single advertisable rebuild, got {}",
+            e.advertisable_rebuild_count()
+        );
+
+        // Advance past every link's interval and tick: the per-tick delta computation for all 20
+        // links must again share a single rebuild (a fresh one, since now_secs moved). Deltas may be
+        // empty (nothing changed since link_up already told everything) — the rebuild count is what
+        // this test asserts, not the delta contents.
+        let _out = e.tick(1_000_000 + 61_000);
+        assert_eq!(
+            e.advertisable_rebuild_count(),
+            2,
+            "one tick covering 20 links must add exactly one more rebuild (now_secs changed once), got {}",
+            e.advertisable_rebuild_count()
+        );
+    }
+
+    /// The cache must not go stale: a `known` mutation between two calls at the same `now_secs` MUST
+    /// force a rebuild so a newly upserted (or removed) peer is reflected immediately.
+    #[test]
+    fn cache_invalidates_on_known_mutation_even_at_same_now_secs() {
+        let mut e = eng(&hex_id(0));
+        e.upsert_known(known_entry(1, 1_000));
+        let now_ms = 1_000_000;
+
+        let first = e.advertisable_for(&hex_id(99), now_ms / 1000);
+        assert_eq!(first.len(), 1);
+        assert_eq!(e.advertisable_rebuild_count(), 1);
+
+        // Same now_secs, but known changed — must rebuild, not serve the stale cached list.
+        e.upsert_known(known_entry(2, 1_000));
+        let second = e.advertisable_for(&hex_id(99), now_ms / 1000);
+        assert_eq!(second.len(), 2, "the newly upserted peer must appear");
+        assert_eq!(
+            e.advertisable_rebuild_count(),
+            2,
+            "a known mutation must invalidate the cache even at the same now_secs"
+        );
+
+        // Same now_secs, no mutation — must reuse the cache (no third rebuild).
+        let third = e.advertisable_for(&hex_id(98), now_ms / 1000);
+        assert_eq!(third.len(), 2);
+        assert_eq!(
+            e.advertisable_rebuild_count(),
+            2,
+            "an unchanged known set at the same now_secs must reuse the cached build"
+        );
+    }
+
+    /// The cached base is still correctly filtered per-partner: excluding one link's partner must
+    /// never leak into another link's view, even though they share the same cached base list.
+    #[test]
+    fn cached_base_still_excludes_each_links_own_partner() {
+        let mut e = eng(&hex_id(0));
+        e.upsert_known(known_entry(1, 1_000));
+        e.upsert_known(known_entry(2, 1_000));
+        let now_secs = 1_000;
+
+        let for_1 = e.advertisable_for(&hex_id(1), now_secs);
+        assert!(
+            for_1.iter().all(|p| p.peer_id != hex_id(1)),
+            "peer 1's own link must never be advertised back to it"
+        );
+        assert!(for_1.iter().any(|p| p.peer_id == hex_id(2)));
+
+        let for_2 = e.advertisable_for(&hex_id(2), now_secs);
+        assert!(for_2.iter().all(|p| p.peer_id != hex_id(2)));
+        assert!(for_2.iter().any(|p| p.peer_id == hex_id(1)));
     }
 }
