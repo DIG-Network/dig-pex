@@ -223,7 +223,7 @@ impl PexEngine {
         link.self_interval_secs = interval;
         link.handshake_sent = true;
         for e in &peers {
-            link.told.insert(e.peer_id.clone(), e.fingerprint());
+            link.told.insert(e.peer_id.clone(), e.fingerprint_hash());
         }
         link.snapshot_sent = true;
         link.last_data_send_ms = Some(now_ms);
@@ -325,7 +325,7 @@ impl PexEngine {
             // Commit the told-state for exactly what we send (SPEC §9.1); the capped remainder recurs.
             let link = self.links.get_mut(&peer_id).expect("link exists");
             for e in &added {
-                link.told.insert(e.peer_id.clone(), e.fingerprint());
+                link.told.insert(e.peer_id.clone(), e.fingerprint_hash());
             }
             for id in &dropped {
                 link.told.remove(id);
@@ -751,7 +751,8 @@ impl PexEngine {
                 continue; // keep collecting ids for the dropped-set below; added is already capped
             }
             match link.told.get(&e.peer_id) {
-                Some(fp) if *fp == e.fingerprint() => {} // unchanged — never re-advertise (SPEC §9.1)
+                // Cheap, allocation-free u64 equality — the hot-path check (#179 MED optimization).
+                Some(fp) if *fp == e.fingerprint_hash() => {} // unchanged — never re-advertise (SPEC §9.1)
                 _ => added.push(e.clone()),
             }
         }

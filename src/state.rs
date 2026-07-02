@@ -44,9 +44,11 @@ pub struct LinkState {
     pub handshake_sent: bool,
     /// Whether we have sent our one `pex_snapshot` on this link.
     pub snapshot_sent: bool,
-    /// Per-link told-state (SPEC §9.1): `peer_id → advertised-content fingerprint`. Deltas are
-    /// computed relative to this; an unchanged told entry is never re-advertised.
-    pub told: HashMap<String, String>,
+    /// Per-link told-state (SPEC §9.1): `peer_id → advertised-content fingerprint hash`
+    /// ([`PeerEntry::fingerprint_hash`](crate::entry::PeerEntry::fingerprint_hash), a `Copy`,
+    /// allocation-free `u64` rather than the display-oriented `String` form — #179 MED optimization).
+    /// Deltas are computed relative to this; an unchanged told entry is never re-advertised.
+    pub told: HashMap<String, u64>,
     /// When we last sent a **data message** (snapshot or delta) on this link, in `now_ms`. `None`
     /// until the snapshot goes out; the cadence spaces subsequent sends from here (SPEC §6.1).
     pub last_data_send_ms: Option<u64>,

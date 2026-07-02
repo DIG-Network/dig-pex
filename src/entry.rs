@@ -252,6 +252,10 @@ impl PeerEntry {
     /// **excluding `last_seen`** (SPEC §9.1), so heartbeat churn (a fresher `last_seen` alone) never
     /// re-advertises an unchanged peer. Two entries with the same fingerprint are "the same
     /// advertisement" for delta purposes.
+    ///
+    /// This allocates (a `Vec<String>` per call plus the final formatted `String`) and is intended
+    /// for display/debugging/tests. The delta hot path uses the allocation-free
+    /// [`fingerprint_hash`](Self::fingerprint_hash) instead (#179 MED optimization).
     #[must_use]
     pub fn fingerprint(&self) -> String {
         let mut addrs: Vec<String> = self
@@ -263,6 +267,50 @@ impl PeerEntry {
         let mut flags = self.flags.clone();
         flags.sort();
         format!("{}#{}", addrs.join(","), flags.join(","))
+    }
+
+    /// The allocation-free equivalent of [`fingerprint`](Self::fingerprint): a 64-bit hash over the
+    /// same canonical content (addresses + flags, sorted, **excluding `last_seen`**) with the same
+    /// equality semantics — two entries with equal `fingerprint()` strings MUST have equal
+    /// `fingerprint_hash()` values (and vice versa for practical purposes; a hash collision is
+    /// possible but not a correctness concern for this delta-suppression use). Used as the `told`-map
+    /// value (SPEC §9.1) so the per-tick, per-link delta comparison is a `Copy`, allocation-free `u64`
+    /// equality check instead of building + sorting + formatting a `String` per advertisable entry
+    /// per link per tick (#179 MED optimization).
+    ///
+    /// Sorts addresses/flags by **reference** (`Vec<&Address>` / `Vec<&str>`, no cloning) before
+    /// feeding a stable field-separated byte stream to the hasher, so the result is independent of
+    /// input order while never allocating an intermediate `String`.
+    #[must_use]
+    pub fn fingerprint_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let mut addrs: Vec<&Address> = self.addresses.iter().collect();
+        addrs.sort_by(|a, b| {
+            (a.host.as_str(), a.port, a.kind.as_str()).cmp(&(
+                b.host.as_str(),
+                b.port,
+                b.kind.as_str(),
+            ))
+        });
+        let mut flags: Vec<&str> = self.flags.iter().map(String::as_str).collect();
+        flags.sort_unstable();
+
+        // A fixed-seed hasher (not HashMap's randomized default) so the result is reproducible within
+        // and across engine instances in the same process run — only ever compared in-memory, never
+        // persisted or sent over the wire, so cross-process/version stability is not required.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        addrs.len().hash(&mut hasher);
+        for a in &addrs {
+            a.host.hash(&mut hasher);
+            a.port.hash(&mut hasher);
+            a.kind.as_str().hash(&mut hasher);
+        }
+        flags.len().hash(&mut hasher);
+        for f in &flags {
+            f.hash(&mut hasher);
+        }
+        hasher.finish()
     }
 }
 
@@ -458,6 +506,61 @@ mod tests {
             b.fingerprint(),
             "a flag change must change fingerprint"
         );
+    }
+
+    /// MEDIUM finding (#179): `fingerprint_hash()` is the allocation-free hot-path equality check
+    /// used in the delta loop (`told` stores this hash, not the `String` fingerprint). It MUST agree
+    /// with `fingerprint()`'s equality semantics: same addresses+flags (order-independent) and
+    /// `last_seen`-independence hash equal; a real content change hashes different.
+    #[test]
+    fn fingerprint_hash_matches_fingerprint_equality_semantics() {
+        let a = PeerEntry::new(hex(0x07), "mainnet", 100, Provenance::Direct)
+            .with_address(Address::direct("h", 1))
+            .with_flag("storage");
+        let a2 = PeerEntry::new(hex(0x07), "mainnet", 999, Provenance::Direct)
+            .with_address(Address::direct("h", 1))
+            .with_flag("storage");
+        assert_eq!(
+            a.fingerprint_hash(),
+            a2.fingerprint_hash(),
+            "last_seen must not affect fingerprint_hash"
+        );
+        assert_eq!(
+            a.fingerprint() == a2.fingerprint(),
+            a.fingerprint_hash() == a2.fingerprint_hash(),
+            "fingerprint_hash must agree with fingerprint on equality"
+        );
+
+        let b = a2.clone().with_flag("holepunch");
+        assert_ne!(
+            a.fingerprint_hash(),
+            b.fingerprint_hash(),
+            "a flag change must change fingerprint_hash"
+        );
+        assert_eq!(
+            a.fingerprint() == b.fingerprint(),
+            a.fingerprint_hash() == b.fingerprint_hash(),
+            "fingerprint_hash must agree with fingerprint on inequality"
+        );
+
+        // Multiple addresses/flags supplied in a different insertion order must still hash equal
+        // (the canonical form sorts both before hashing, same as `fingerprint()`).
+        let c = PeerEntry::new(hex(0x08), "mainnet", 1, Provenance::Direct)
+            .with_address(Address::direct("h1", 1))
+            .with_address(Address::direct("h2", 2))
+            .with_flag("storage")
+            .with_flag("holepunch");
+        let d = PeerEntry::new(hex(0x08), "mainnet", 2, Provenance::Direct)
+            .with_address(Address::direct("h2", 2))
+            .with_address(Address::direct("h1", 1))
+            .with_flag("holepunch")
+            .with_flag("storage");
+        assert_eq!(
+            c.fingerprint_hash(),
+            d.fingerprint_hash(),
+            "address/flag insertion order must not affect fingerprint_hash"
+        );
+        assert_eq!(c.fingerprint(), d.fingerprint());
     }
 
     #[test]
