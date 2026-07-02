@@ -19,8 +19,8 @@
 use std::collections::HashMap;
 
 use crate::caps::{
-    PEX_MAX_ADDED, PEX_MAX_DROPPED, PEX_MAX_INTERVAL, PEX_MAX_SNAPSHOT, PEX_VERSION,
-    PEX_VIOLATION_LIMIT,
+    PEX_MAX_ADDED, PEX_MAX_DROPPED, PEX_MAX_HINTS, PEX_MAX_INTERVAL, PEX_MAX_RECEIVED_PER_LINK,
+    PEX_MAX_SNAPSHOT, PEX_VERSION, PEX_VIOLATION_LIMIT,
 };
 use crate::entry::{PeerEntry, ValidateCtx};
 use crate::error::PexErrorCode;
@@ -361,6 +361,20 @@ impl PexEngine {
             .map(|h| (h.source.as_str(), h.last_seen))
     }
 
+    /// How many `peer_id`s `peer_id`'s link has told us are currently tracked in its `received`
+    /// accumulator (SPEC §9.2, §11.3) — bounded by [`crate::caps::PEX_MAX_RECEIVED_PER_LINK`].
+    #[must_use]
+    pub fn received_count(&self, peer_id: &str) -> usize {
+        self.links.get(peer_id).map_or(0, |l| l.received.len())
+    }
+
+    /// The total number of deduplicated hints currently held across all links (SPEC §9.2, §11.3) —
+    /// bounded by [`crate::caps::PEX_MAX_HINTS`].
+    #[must_use]
+    pub fn hints_count(&self) -> usize {
+        self.hints.len()
+    }
+
     // ----- internals -----
 
     fn draw_jitter(&self, effective_secs: u32) -> u64 {
@@ -492,12 +506,16 @@ impl PexEngine {
                 continue; // malformed entry — skip silently (SPEC §3.3, §7.3)
             }
             let ce = e.clamped(now_secs);
-            // Attribute the hint to this link so a later `dropped` can be matched (SPEC §8.3).
-            self.links
-                .get_mut(peer_id)
-                .expect("link exists")
-                .received
-                .insert(ce.peer_id.clone(), ce.last_seen);
+            // Attribute the hint to this link so a later `dropped` can be matched (SPEC §8.3). Bound
+            // the accumulator first (HIGH #179): a single authenticated peer must not be able to grow
+            // this link's `received` map without limit by streaming many distinct fresh peer_ids.
+            let link = self.links.get_mut(peer_id).expect("link exists");
+            if !link.received.contains_key(&ce.peer_id)
+                && link.received.len() >= PEX_MAX_RECEIVED_PER_LINK
+            {
+                evict_oldest(&mut link.received, |last_seen| *last_seen);
+            }
+            link.received.insert(ce.peer_id.clone(), ce.last_seen);
             // Dedup: newest `last_seen` wins as the current hint (SPEC §9.2); only surface an entry
             // that is new or fresher than what we already hold, to avoid re-dialing stale duplicates.
             let fresher = match self.hints.get(&ce.peer_id) {
@@ -505,6 +523,11 @@ impl PexEngine {
                 None => true,
             };
             if fresher {
+                // Bound the global hints map the same way (HIGH #179): many links each contributing
+                // distinct peer_ids must not grow this map without limit.
+                if !self.hints.contains_key(&ce.peer_id) && self.hints.len() >= PEX_MAX_HINTS {
+                    evict_oldest(&mut self.hints, |h| h.last_seen);
+                }
                 self.hints.insert(
                     ce.peer_id.clone(),
                     ReceivedHint {
@@ -561,6 +584,7 @@ impl PexEngine {
         let mute = link.strikes >= PEX_VIOLATION_LIMIT;
         if mute {
             link.muted = true;
+            self.free_muted_link_state(peer_id);
         }
         PexOutcome {
             replies: vec![PexMessage::PexError {
@@ -579,6 +603,7 @@ impl PexEngine {
     /// underlying connection — PEX is an optional overlay.
     fn mute_mismatch(&mut self, peer_id: &str, code: PexErrorCode) -> PexOutcome {
         self.links.get_mut(peer_id).expect("link exists").muted = true;
+        self.free_muted_link_state(peer_id);
         PexOutcome {
             replies: vec![PexMessage::PexError {
                 code: code.as_u16(),
@@ -589,6 +614,32 @@ impl PexEngine {
                 mute: true,
             }],
         }
+    }
+
+    /// Free accumulated state for a link whose incoming direction was just muted (SPEC §9.2, §11.3 —
+    /// HIGH #179 fix): treat mute like a soft `link_down` for the `received`/`hints` accumulators,
+    /// since a muted direction accepts no further inbound PEX (`on_message` early-returns) and so can
+    /// never again reference or grow that state. This bounds memory promptly rather than waiting for
+    /// the real `link_down` (which may be much later, or never, if the transport itself stays open).
+    fn free_muted_link_state(&mut self, peer_id: &str) {
+        if let Some(link) = self.links.get_mut(peer_id) {
+            link.received.clear();
+        }
+        self.hints.retain(|_, h| h.source != peer_id);
+    }
+}
+
+/// Evict the single oldest entry (by `last_seen`, ascending) from a bounded accumulator (SPEC §9.2,
+/// §11.3 — HIGH #179). Called once, immediately before an insert that would otherwise exceed the
+/// map's cardinality bound, so the map never grows past its cap. Ties break on key order for
+/// determinism. A no-op on an empty map (the caller only reaches the cap check when non-empty).
+fn evict_oldest<V>(map: &mut HashMap<String, V>, last_seen: impl Fn(&V) -> u64) {
+    if let Some(oldest_key) = map
+        .iter()
+        .min_by(|(ka, va), (kb, vb)| last_seen(va).cmp(&last_seen(vb)).then_with(|| ka.cmp(kb)))
+        .map(|(k, _)| k.clone())
+    {
+        map.remove(&oldest_key);
     }
 }
 
@@ -651,5 +702,138 @@ impl PexEngine {
         dropped.sort(); // deterministic order
 
         (added, dropped)
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+    use crate::caps::{PEX_MAX_HINTS, PEX_MAX_RECEIVED_PER_LINK};
+    use crate::entry::{Address, Provenance};
+
+    fn hex_id(n: u32) -> String {
+        // A deterministic, distinct 64-hex peer_id for index `n`.
+        format!("{n:064x}")
+    }
+
+    fn eng(local: &str) -> PexEngine {
+        PexEngine::new(PexConfig::new(local.to_string(), "mainnet".to_string()).with_jitter(false))
+    }
+
+    /// Ensure a link entry exists for `peer_id` (mirrors what `on_message` does before dispatch) so
+    /// the private `ingest_added`/`strike` helpers can be exercised directly in these tests.
+    fn ensure_link(e: &mut PexEngine, peer_id: &str) {
+        let interval = e.cfg.interval;
+        e.links
+            .entry(peer_id.to_string())
+            .or_insert_with(|| LinkState::new(interval));
+    }
+
+    fn distinct_entry(n: u32, now_secs: u64) -> PeerEntry {
+        PeerEntry::new(hex_id(n), "mainnet", now_secs, Provenance::Direct)
+            .with_address(Address::direct("203.0.113.7", 9444))
+    }
+
+    /// HIGH finding (#179): a single authenticated peer streaming far more than
+    /// `PEX_MAX_RECEIVED_PER_LINK` distinct fresh `peer_id`s over the life of a link must not grow
+    /// that link's `received` accumulator without bound — it must stay capped, with the oldest
+    /// entries evicted to make room for newer ones.
+    #[test]
+    fn received_map_is_capped_per_link_with_eviction() {
+        let local = hex_id(0);
+        let sender = hex_id(1);
+        let mut e = eng(&local);
+        let now_ms = 1_000_000_000_u64;
+
+        ensure_link(&mut e, &sender);
+        // Stream well past the cap in batches (ingest_added has no per-call size limit of its own —
+        // the message-level cap is enforced by on_delta/on_snapshot before this point).
+        let total = PEX_MAX_RECEIVED_PER_LINK + 500;
+        for n in 2..2 + total as u32 {
+            let entry = distinct_entry(n, now_ms / 1000);
+            e.ingest_added(&sender, vec![entry], now_ms);
+        }
+
+        assert!(
+            e.received_count(&sender) <= PEX_MAX_RECEIVED_PER_LINK,
+            "received map must stay bounded at PEX_MAX_RECEIVED_PER_LINK, got {}",
+            e.received_count(&sender)
+        );
+        // The oldest ids (evicted first) must be gone; the newest must remain.
+        assert!(
+            !e.links[&sender].received.contains_key(&hex_id(2)),
+            "the oldest entry should have been evicted"
+        );
+        let newest = hex_id(1 + total as u32);
+        assert!(
+            e.links[&sender].received.contains_key(&newest),
+            "the newest entry must survive eviction"
+        );
+    }
+
+    /// HIGH finding (#179): the engine-global `hints` map must stay bounded even when many distinct
+    /// links each contribute distinct fresh `peer_id`s, with oldest-`last_seen` eviction.
+    #[test]
+    fn hints_map_is_capped_globally_with_eviction() {
+        let local = hex_id(0);
+        let mut e = eng(&local);
+        let now_ms = 1_000_000_000_u64;
+
+        let total = PEX_MAX_HINTS + 500;
+        for n in 0..total as u32 {
+            // A distinct sender per entry so every hint is a genuinely new peer_id from a live link.
+            let sender = hex_id(1_000_000 + n);
+            ensure_link(&mut e, &sender);
+            let entry = distinct_entry(2_000_000 + n, now_ms / 1000 + u64::from(n));
+            e.ingest_added(&sender, vec![entry], now_ms);
+        }
+
+        assert!(
+            e.hints_count() <= PEX_MAX_HINTS,
+            "hints map must stay bounded at PEX_MAX_HINTS, got {}",
+            e.hints_count()
+        );
+        // The oldest (lowest last_seen) hint must have been evicted; the newest must remain.
+        assert!(
+            e.current_hint(&hex_id(2_000_000)).is_none(),
+            "the oldest hint should have been evicted"
+        );
+        let newest_peer = hex_id(2_000_000 + total as u32 - 1);
+        assert!(
+            e.current_hint(&newest_peer).is_some(),
+            "the newest hint must survive eviction"
+        );
+    }
+
+    /// Muting a direction is treated like a soft `link_down` for accumulated state (#179 fix note):
+    /// the link's `received` entries and any global `hints` sourced from it are freed immediately,
+    /// not left to accumulate until the real `link_down`.
+    #[test]
+    fn muting_a_direction_frees_its_received_and_sourced_hints() {
+        let local = hex_id(0);
+        let sender = hex_id(1);
+        let mut e = eng(&local);
+        let now_ms = 1_000_000_000_u64;
+
+        ensure_link(&mut e, &sender);
+        e.ingest_added(&sender, vec![distinct_entry(2, now_ms / 1000)], now_ms);
+        assert_eq!(e.received_count(&sender), 1);
+        assert!(e.current_hint(&hex_id(2)).is_some());
+
+        // Force three strikes to mute the incoming direction.
+        for _ in 0..3 {
+            e.strike(&sender, PexErrorCode::ProtocolViolation);
+        }
+        assert!(e.is_muted(&sender));
+
+        assert_eq!(
+            e.received_count(&sender),
+            0,
+            "received state must be freed when the direction is muted"
+        );
+        assert!(
+            e.current_hint(&hex_id(2)).is_none(),
+            "hints sourced from a now-muted link must be cleared"
+        );
     }
 }

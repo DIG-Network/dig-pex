@@ -49,6 +49,19 @@ pub const PEX_MAX_ENTRY_AGE: u64 = 1800;
 /// Strikes on a direction before it is muted / the peer may be disconnected (SPEC §7.1, §11.2).
 pub const PEX_VIOLATION_LIMIT: u32 = 3;
 
+/// Hard ceiling on a single link's `received` accumulator (SPEC §9.2, §11.3) — the set of `peer_id`s
+/// that link has told us, kept for `dropped` attribution. Bounds per-link memory from an authenticated
+/// peer that streams an unbounded number of distinct fresh `peer_id`s over the link's lifetime; a
+/// single message is already capped by [`PEX_MAX_ADDED`]/[`PEX_MAX_SNAPSHOT`], but that does not bound
+/// the cumulative total across many messages. Oldest-`last_seen` entries are evicted first once the
+/// cap is reached.
+pub const PEX_MAX_RECEIVED_PER_LINK: usize = 4096;
+
+/// Hard ceiling on the engine-global `hints` map (SPEC §9.2, §11.3) — the deduplicated best hint per
+/// `peer_id` across all links. Bounds total memory when many links each contribute distinct
+/// `peer_id`s. Oldest-`last_seen` entries are evicted first once the cap is reached.
+pub const PEX_MAX_HINTS: usize = 16_384;
+
 /// Whether a frame body of `len` bytes is within [`PEX_MAX_FRAME`]. A caller MUST check this
 /// **before** allocating or reading the body (the stream binding checks the length prefix; the relay
 /// binding checks the WebSocket payload length).
@@ -79,6 +92,8 @@ mod tests {
         assert_eq!(PEX_ARRIVAL_GRACE, 5);
         assert_eq!(PEX_MAX_ENTRY_AGE, 1800);
         assert_eq!(PEX_VIOLATION_LIMIT, 3);
+        assert_eq!(PEX_MAX_RECEIVED_PER_LINK, 4096);
+        assert_eq!(PEX_MAX_HINTS, 16_384);
     }
 
     #[test]

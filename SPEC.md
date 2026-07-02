@@ -330,6 +330,8 @@ A sender receiving `pex_error` code `3` SHOULD double its effective interval on 
 | `PEX_ARRIVAL_GRACE` | `5` s | Receiver's enforcement tolerance (§6.4). |
 | `PEX_MAX_ENTRY_AGE` | `1800` s | Max `last_seen` age an entry may be advertised with (§8.2). |
 | `PEX_VIOLATION_LIMIT` | `3` | Strikes before a link's PEX is muted / the peer disconnected (§11.2). |
+| `PEX_MAX_RECEIVED_PER_LINK` | `4096` | Cap on one link's `received` accumulator, oldest-`last_seen` evicted (§9.2, §11.3). |
+| `PEX_MAX_HINTS` | `16384` | Cap on the engine-global `hints` map, oldest-`last_seen` evicted (§9.2, §11.3). |
 
 ### 7.2 Oversize handling
 
@@ -408,6 +410,24 @@ it has told this link, with a fingerprint of each entry's advertised content (ad
 Received entries are deduplicated by `peer_id`; for duplicates from different senders the entry
 with the newest `last_seen` wins as the current hint. Hints are stored with their source link so
 a `dropped` (§8.3) and a violation-triggered cleanup (§11.2) can be attributed.
+
+Both receiver-side accumulators are **bounded** — a single per-message cap (§7.1's
+`PEX_MAX_ADDED`/`PEX_MAX_SNAPSHOT`) bounds one message but not the cumulative total an
+authenticated sender can push across many messages over a link's lifetime:
+
+- **Per-link `received`** (the set of `peer_id`s that link has told us, kept for §8.3 `dropped`
+  attribution) is capped at `PEX_MAX_RECEIVED_PER_LINK` (4096) entries.
+- **The global `hints` map** (the deduplicated current-best hint per `peer_id`, across all links)
+  is capped at `PEX_MAX_HINTS` (16384) entries.
+- On an insert that would exceed either cap, the implementation MUST evict the single
+  oldest-`last_seen` entry from that map first (ties broken deterministically, e.g. by `peer_id`)
+  before inserting the new one — an LRU-by-freshness policy mirroring the address manager's own
+  eviction (§9.3). A cap MUST NOT be enforced by rejecting the new (fresher) entry instead.
+- When a direction is muted (§11.2), the implementation MUST treat it like a soft `link_down` for
+  these accumulators: clear that link's `received` set and remove any `hints` entries currently
+  sourced from it, immediately — not deferred until the underlying connection actually closes. A
+  muted direction accepts no further inbound PEX, so its accumulated state can only ever be freed,
+  never usefully grown.
 
 ### 9.3 Interaction with the address manager / peer pool
 
@@ -495,6 +515,13 @@ Every inbound surface is bounded before allocation: frame size (§7.2), list cap
 per-entry address/flag caps, and the arrival-rate floor (§6.4). A hostile sender can therefore
 cost a receiver at most one bounded frame per `PEX_MIN_INTERVAL` per link before it is muted.
 
+Per-message caps are not sufficient on their own: an authenticated peer that stays within every
+per-message cap can still, over many messages across a link's lifetime, push an unbounded number
+of *distinct* `peer_id`s. The receiver-side accumulators this would otherwise grow without limit
+(the per-link `received` set and the global `hints` map, §9.2) are therefore themselves bounded
+(`PEX_MAX_RECEIVED_PER_LINK`, `PEX_MAX_HINTS`) with oldest-`last_seen` eviction, and are freed
+promptly on mute rather than left to accumulate until the connection closes (§9.2).
+
 ### 11.4 Eclipse & poisoning resistance
 
 The first-hand rule (§8.1) stops re-gossip amplification; the address-manager integration (§9.3)
@@ -523,6 +550,7 @@ The frozen, testable statements of version 1. An implementation conforms iff all
 | PEX-12 | Node↔node: PEX rides one self-identifying logical stream per advertising direction on the dig-nat mux; identity is the mTLS `peer_id`, never a wire field. |
 | PEX-13 | Relay binding (RLY-008): purely additive to RLY-001..RLY-007; gated on the node's `pex_handshake` after registration; relay entries are registration-backed with `via:"introducer"`; node-sent data messages never enter the introducer registry. |
 | PEX-14 | The error envelope is `pex_error` with the §4.5 code table, on both bindings; errors are advisory. |
+| PEX-15 | The per-link `received` set is capped at `PEX_MAX_RECEIVED_PER_LINK` and the global `hints` map at `PEX_MAX_HINTS`, both with oldest-`last_seen` eviction on overflow; muting a direction immediately clears its `received` set and any `hints` it sources. |
 
 Cross-references: the L7 peer-network page (`docs.dig.net` → protocol → peer-network) defines the
 `peer_id`, the address/`Contact` shapes, RLY-001..RLY-007, and the framed-JSON convention this
