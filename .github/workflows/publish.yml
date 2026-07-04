@@ -9,8 +9,10 @@ name: Publish to crates.io
 # the tree minimal), so there is no release-ordering dependency on other DIG crates: the published
 # build resolves entirely from crates.io.
 
-# crates.io publish is MANUAL (workflow_dispatch only) pending the crates.io-publishing decision (#230).
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       version:
