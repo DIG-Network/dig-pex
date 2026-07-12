@@ -1,9 +1,11 @@
 name: Publish to crates.io
 
-# Tag-driven release: pushing a version tag `vX.Y.Z` runs the gates, publishes to crates.io, and
-# cuts a GitHub Release. A normal push to `main` runs the gates only (see ci.yml) — it does NOT
-# publish. Mirrors the sibling DIG crates (dig-dht / dig-download / dig-nat / dig-constants) so the
-# same org secrets apply.
+# Tag-driven release: pushing a version tag `vX.Y.Z` builds, packages, and publishes to crates.io,
+# then cuts a GitHub Release. It does NOT re-run the test/coverage gate — that already ran (and
+# gated the merge) on the PR via ci.yml against the exact tree this tag points at (#488: a
+# full-suite re-run here only slows/duplicates the release with no new signal). A normal push to
+# `main` runs the gates only (see ci.yml) — it does NOT publish. Mirrors the sibling DIG crates
+# (dig-dht / dig-download / dig-nat / dig-constants) so the same org secrets apply.
 #
 # dig-pex is standalone (no DIG git dependencies — the peer entry is mirrored, not imported, to keep
 # the tree minimal), so there is no release-ordering dependency on other DIG crates: the published
@@ -27,43 +29,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  gate:
-    name: Gate (fmt / clippy / test / coverage >=80%)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy, llvm-tools-preview
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Check clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Run tests with coverage (gate >=80% lines)
-        run: >-
-          cargo llvm-cov --all
-          --fail-under-lines 80
-
-      - name: Check documentation
-        run: cargo doc --no-deps
-
+  # No test/coverage re-run here (#488): the merged tree that produced this tag already passed the
+  # full ci.yml gate set (fmt/clippy/nextest/coverage>=80%) on its PR. Deploy = build + package +
+  # publish only.
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: gate
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
