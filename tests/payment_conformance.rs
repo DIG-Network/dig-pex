@@ -237,6 +237,81 @@ fn a_record_without_the_field_still_decodes_and_is_simply_unpayable() {
     );
 }
 
+/// The largest entry the caps permit: `PEX_MAX_ADDRESSES` IPv6 addresses and `PEX_MAX_FLAGS`
+/// maximal-length flags. Used to size the worst case honestly rather than measuring a typical entry
+/// and hoping.
+fn maximal_entry(node: &Node, claim: Option<PaymentClaim>) -> PeerEntry {
+    let mut e = PeerEntry::new(node.peer_id(), MAINNET, 1_000, Provenance::Direct);
+    for a in 0..dig_pex::PEX_MAX_ADDRESSES {
+        e = e.with_address(Address::direct(
+            "2001:0db8:0000:0000:0000:ff00:0042:8329",
+            9444 + a as u16,
+        ));
+    }
+    for f in 0..dig_pex::PEX_MAX_FLAGS {
+        e = e.with_flag(format!("{}{f}", "x".repeat(dig_pex::PEX_MAX_FLAG_LEN - 1)));
+    }
+    match claim {
+        Some(c) => e.with_payment(c),
+        None => e,
+    }
+}
+
+/// Pins what the claim costs on the wire, from both sides, because the number is what the frame
+/// budget below is reasoned from — a cost that drifts silently would invalidate that reasoning
+/// without failing anything.
+#[test]
+fn a_claim_costs_about_a_third_of_a_kilobyte_per_entry() {
+    let node = Node::new(7);
+    let with = serde_json::to_vec(&maximal_entry(&node, Some(node.claim(MAINNET, PAYEE)))).unwrap();
+    let without = serde_json::to_vec(&maximal_entry(&node, None)).unwrap();
+
+    let cost = with.len() - without.len();
+    assert!(
+        (300..=360).contains(&cost),
+        "the payment claim costs {cost} B/entry (P-256: 68 B address + 124 B base64 SPKI \
+         + ~96 B base64 signature + JSON keys); the frame budget assumes ~334"
+    );
+}
+
+/// **A sender must never emit a frame a receiver is required to reject.** `PEX_MAX_SNAPSHOT` (200)
+/// entries was only ever a proxy for the real bound, which is bytes: at 200 maximal entries the
+/// snapshot is already 214 KB *without* payment claims, so 334 B/entry of signature pushes it over
+/// the 256 KiB frame cap — and an over-cap frame costs the sender a violation strike.
+///
+/// The fixture is therefore the exact worst case the caps permit, and the test checks both halves:
+/// the emitted frame fits, AND it actually dropped entries (a snapshot that fitted because the
+/// fixture was too small would prove nothing about the trim).
+#[test]
+fn an_engine_never_emits_a_snapshot_over_the_frame_cap() {
+    let node = Node::new(7);
+    let claim = node.claim(MAINNET, PAYEE);
+    let mut engine = dig_pex::PexEngine::new(
+        dig_pex::PexConfig::new("a".repeat(64), MAINNET).with_jitter(false),
+    );
+    for i in 0..dig_pex::PEX_MAX_SNAPSHOT {
+        let mut e = maximal_entry(&node, Some(claim.clone()));
+        e.peer_id = format!("{:064x}", i + 1);
+        engine.upsert_known(e);
+    }
+
+    let out = engine.link_up(&"b".repeat(64), 1_000_000);
+    let dig_pex::PexMessage::PexSnapshot { peers } = &out[1] else {
+        panic!("link_up emits handshake then snapshot");
+    };
+
+    assert!(
+        peers.len() < dig_pex::PEX_MAX_SNAPSHOT,
+        "the fixture must actually exceed the byte budget, else the trim is untested"
+    );
+    assert!(
+        dig_pex::caps::frame_within_bound(out[1].encode().len()),
+        "emitted snapshot frame is {} B, over the {} B cap",
+        out[1].encode().len(),
+        dig_pex::PEX_MAX_FRAME
+    );
+}
+
 /// A claim survives the wire — the JSON is what a third party re-verifies from, so the encoded form
 /// must carry everything verification needs.
 #[test]

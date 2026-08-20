@@ -19,7 +19,7 @@
 # those crates in, so PEX keeps a minimal dependency surface. See `entry.rs`.
 [package]
 name = "dig-pex"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -42,10 +42,17 @@ tokio = { version = "1", features = ["rt", "macros", "io-util"] }
 
 # Additive send jitter (0..+10% of the effective interval) to decorrelate network-wide cadence ticks.
 rand = "0.8"
+# The `peer_id` = SHA-256(TLS SPKI DER) binding a payment claim proves itself with (SPEC 3.4.3).
+# Computed HERE rather than delegated to the injected verifier, so a permissive verifier cannot be
+# induced to name the wrong payee.
 sha2 = "0.10"
+
+# The `spki` / `sig` fields of a payment claim travel base64 inside JSON.
 base64 = "0.22"
 
 [dev-dependencies]
+# A REAL ECDSA P-256 verifier for the payment-claim tests — the curve dig-tls issues node leaf
+# certs on. A stub verifier could not tell a bound signature from an unbound one.
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 # `#[tokio::test]` for the async framing round-trips; `Cursor` drives decode with no real network.
 tokio = { version = "1", features = ["rt", "macros", "io-util"] }

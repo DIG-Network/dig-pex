@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 
+use crate::caps::frame_within_bound;
 use crate::caps::{
     PEX_MAX_ADDED, PEX_MAX_DROPPED, PEX_MAX_HINTS, PEX_MAX_INTERVAL, PEX_MAX_RECEIVED_PER_LINK,
     PEX_MAX_SNAPSHOT, PEX_VERSION, PEX_VIOLATION_LIMIT,
@@ -212,6 +213,7 @@ impl PexEngine {
         let now_secs = now_ms / 1000;
         let mut peers = self.advertisable_for(peer_id, now_secs);
         peers.truncate(PEX_MAX_SNAPSHOT);
+        trim_to_frame_budget(&mut peers);
 
         let remote_declared = self.links.get(peer_id).and_then(|l| l.remote_declared_secs);
         let jitter = self.draw_jitter(effective_interval_secs(interval, remote_declared));
@@ -791,6 +793,35 @@ impl PexEngine {
         dropped.sort(); // deterministic order
 
         (added, dropped)
+    }
+}
+
+/// Drop trailing entries until the snapshot they form encodes within [`PEX_MAX_FRAME`] (SPEC §7.2's
+/// sender-level cap).
+///
+/// `PEX_MAX_SNAPSHOT` bounds the entry *count*, but the frame cap a receiver enforces is in *bytes*,
+/// and the two stopped agreeing once entries could carry a signed payment claim (SPEC §3.4): 200
+/// maximal entries are ~214 KB unsigned and ~281 KB signed, against a 256 KiB frame. A sender that
+/// ignored the byte bound would emit a frame every conformant receiver must reject — and be struck
+/// for it. Entries arrive freshest-first, so trimming from the tail sheds the least useful ones.
+///
+/// The remainder is not lost: an entry omitted here is simply not in this link's told-set, so the
+/// next delta advertises it (SPEC §9.1).
+fn trim_to_frame_budget(peers: &mut Vec<PeerEntry>) {
+    // Measure the real encoding rather than estimating: the entry is JSON, its size depends on the
+    // address and flag content, and an estimate that drifted low would fail exactly where it matters.
+    let envelope = PexMessage::PexSnapshot { peers: Vec::new() }.encode().len();
+    let mut used = envelope;
+    for (i, entry) in peers.iter().enumerate() {
+        // +1 for the comma joining this entry to the previous one.
+        let cost = serde_json::to_vec(entry).map_or(usize::MAX, |b| b.len() + 1);
+        match used.checked_add(cost) {
+            Some(total) if frame_within_bound(total) => used = total,
+            _ => {
+                peers.truncate(i);
+                return;
+            }
+        }
     }
 }
 
