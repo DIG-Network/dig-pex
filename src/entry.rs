@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::caps::{PEX_MAX_ADDRESSES, PEX_MAX_ENTRY_AGE, PEX_MAX_FLAGS, PEX_MAX_FLAG_LEN};
 use crate::error::EntrySkip;
+use crate::payment::{PaymentClaim, PaymentClaimError, SignatureVerifier};
 
 /// How a candidate address was learned — the L7 `dig.getPeers` `addresses[].kind` tokens (SPEC §3.1).
 /// The lowercase serde spelling is the frozen wire form.
@@ -168,6 +169,13 @@ pub struct PeerEntry {
     /// Per-peer capability flags (SPEC §3.2). Optional; defaults to empty.
     #[serde(default)]
     pub flags: Vec<String>,
+    /// The peer's self-signed payment address (SPEC §3.4). Optional and omitted entirely when absent,
+    /// so a record stays readable by peers predating the field.
+    ///
+    /// Read it with [`verified_payment_address`](Self::verified_payment_address) — the claim's own
+    /// fields are private precisely so an unchecked payee cannot be obtained from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment: Option<PaymentClaim>,
 }
 
 impl PeerEntry {
@@ -187,6 +195,7 @@ impl PeerEntry {
             last_seen,
             via,
             flags: Vec::new(),
+            payment: None,
         }
     }
 
@@ -202,6 +211,35 @@ impl PeerEntry {
     pub fn with_flag(mut self, flag: impl Into<String>) -> Self {
         self.flags.push(flag.into());
         self
+    }
+
+    /// Builder: attach the peer's self-signed payment claim (SPEC §3.4).
+    #[must_use]
+    pub fn with_payment(mut self, claim: PaymentClaim) -> Self {
+        self.payment = Some(claim);
+        self
+    }
+
+    /// The peer's payment address, **only** when the attached claim proves this peer designated it on
+    /// this entry's network (SPEC §3.4.3); otherwise the reason there is no payee.
+    ///
+    /// This is deliberately a different question from whether the entry is usable at all: an entry
+    /// whose claim fails here is still a perfectly good dial hint (see
+    /// [`validate`](Self::validate)), because letting a corrupted payee cost a peer its reachability
+    /// would hand a relaying attacker a way to partition it. Reachability and payability are two
+    /// verdicts on one record, and they are answered by two different methods.
+    ///
+    /// `verifier` supplies the signature primitive for the peer's key type (SPEC §3.4.3); the
+    /// `SHA-256(SPKI) == peer_id` binding is checked by this crate regardless of what the verifier
+    /// does.
+    pub fn verified_payment_address(
+        &self,
+        verifier: &impl SignatureVerifier,
+    ) -> Result<&str, PaymentClaimError> {
+        self.payment
+            .as_ref()
+            .ok_or(PaymentClaimError::NotPresent)?
+            .verify(&self.peer_id, &self.network_id, verifier)
     }
 
     /// Validate this entry against the receiver's link context (SPEC §3.3). Returns the reason a
@@ -228,6 +266,11 @@ impl PeerEntry {
         }
         if !self.via.is_registered() {
             return Err(EntrySkip::BadVia);
+        }
+        // Size only — an unverifiable claim is NOT a reason to drop the entry (SPEC §3.4.3); this
+        // bounds what a hostile sender can make a receiver hold, nothing more.
+        if self.payment.as_ref().is_some_and(|p| !p.within_caps()) {
+            return Err(EntrySkip::OversizePayment);
         }
         // A `last_seen` in the future is clamped by the caller (see `clamped`); only an entry too far
         // in the PAST is skipped.
@@ -266,7 +309,12 @@ impl PeerEntry {
         addrs.sort();
         let mut flags = self.flags.clone();
         flags.sort();
-        format!("{}#{}", addrs.join(","), flags.join(","))
+        let payment = self
+            .payment
+            .as_ref()
+            .map(|p| p.wire_parts().join("|"))
+            .unwrap_or_default();
+        format!("{}#{}#{}", addrs.join(","), flags.join(","), payment)
     }
 
     /// The allocation-free equivalent of [`fingerprint`](Self::fingerprint): a 64-bit hash over the
@@ -309,6 +357,11 @@ impl PeerEntry {
         flags.len().hash(&mut hasher);
         for f in &flags {
             f.hash(&mut hasher);
+        }
+        // A replaced or re-signed payment claim is a content change, so it must re-advertise.
+        match &self.payment {
+            Some(p) => p.wire_parts().hash(&mut hasher),
+            None => 0u8.hash(&mut hasher),
         }
         hasher.finish()
     }

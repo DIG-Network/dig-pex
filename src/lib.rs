@@ -76,6 +76,7 @@ pub mod caps;
 pub mod engine;
 pub mod entry;
 pub mod error;
+pub mod payment;
 pub mod state;
 pub mod timer;
 pub mod wire;
@@ -88,5 +89,9 @@ pub use caps::{
 pub use engine::{PexConfig, PexEngine, PexEvent, PexOutcome};
 pub use entry::{Address, AddressKind, PeerEntry, Provenance, ValidateCtx};
 pub use error::{EntrySkip, PexErrorCode};
+pub use payment::{
+    payment_signing_bytes, peer_id_for_spki, PaymentClaim, PaymentClaimError, SignatureVerifier,
+    PEX_MAX_PAYMENT_ADDRESS_LEN, PEX_MAX_PAYMENT_SIG_LEN, PEX_MAX_PAYMENT_SPKI_LEN,
+};
 pub use state::{LinkState, RecvPhase};
 pub use wire::PexMessage;

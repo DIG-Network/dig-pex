@@ -42,8 +42,11 @@ tokio = { version = "1", features = ["rt", "macros", "io-util"] }
 
 # Additive send jitter (0..+10% of the effective interval) to decorrelate network-wide cadence ticks.
 rand = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 # `#[tokio::test]` for the async framing round-trips; `Cursor` drives decode with no real network.
 tokio = { version = "1", features = ["rt", "macros", "io-util"] }
 
