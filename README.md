@@ -33,7 +33,7 @@ its reference implementation.
 
 An entry MAY carry a **self-signed payment address** (SPEC 3.4) so the incentive layer can address
 $DIG to the peer that earned it. It is signed because PEX records are relayed: an unauthenticated
-payee pays whoever last forwarded the record, invisibly.
+payee pays whoever last forwarded the record, invisibly. The claim is public by design — it travels to every peer — so a node publishes one only when its operator has configured a payout address (SPEC 3.4).
 
 The claim carries the peer's TLS SPKI DER and a signature binding `peer_id`, `network_id` and the
 address. Since `peer_id` is `SHA-256(SPKI DER)`, a verifier recomputes that hash and checks the

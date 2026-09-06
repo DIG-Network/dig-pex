@@ -145,6 +145,15 @@ A payee field cannot be an unauthenticated claim. PEX records are **relayed**, s
 means the incentive layer pays whoever last forwarded the record rather than whoever earned it, and
 the victim never observes the difference because a payment that succeeds looks identical either way.
 
+**Privacy: the claim is public by design.** A PEX record is gossiped to every peer that learns of the
+advertised peer and is relayed second- and third-hand, so `address` and `spki` MUST be treated as
+published to the whole network. `spki` reveals nothing new — it is the same public key the peer
+presents in its TLS certificate on every connection — but the claim does publicly and durably link a
+`peer_id` to an on-chain address whose activity is observable by anyone. A peer that does not wish to
+publish a payout address MUST omit the `payment` object; an embedder SHOULD populate it only from an
+explicitly configured payout address and MUST give the operator a way to leave it unset. Receivers
+MUST NOT treat the absence of a claim as a fault (§3.4.3).
+
 #### 3.4.1 Canonical signing bytes
 
 The signature covers exactly, with no separators other than those shown:
