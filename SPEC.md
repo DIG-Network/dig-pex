@@ -93,6 +93,7 @@ peer-network §7) extended with a `flags` list:
 | `last_seen` | uint | REQUIRED. Unix seconds when the **advertiser** last had first-hand evidence of the peer (§8.2). |
 | `via` | string | REQUIRED. The advertiser's **provenance** for this entry (§8.1): `"direct"` \| `"relay"` \| `"introducer"`. |
 | `flags` | array of strings | OPTIONAL (default `[]`). Per-peer capability flags (§3.2). |
+| `payment` | object | OPTIONAL (omitted when absent). The peer's self-signed payment address (§3.4). |
 
 ### 3.2 Flags
 
@@ -127,6 +128,94 @@ following holds (skipping is silent — no error, no violation strike):
 - `last_seen` is more than **1800 seconds** (`PEX_MAX_ENTRY_AGE`) in the past by the receiver's
   clock (SHOULD skip — clock-skew tolerance is the receiver's choice); a `last_seen` in the
   future SHOULD be clamped to the receiver's now.
+
+### 3.4 Payment address
+
+A peer MAY carry a `payment` object designating where the incentive layer should send its earnings:
+
+```json
+"payment": {
+  "address": "xch1...",
+  "spki":    "<base64 of the peer's TLS SubjectPublicKeyInfo DER>",
+  "sig":     "<base64 signature over the canonical bytes of 3.4.1>"
+}
+```
+
+A payee field cannot be an unauthenticated claim. PEX records are **relayed**, so an unsigned payee
+means the incentive layer pays whoever last forwarded the record rather than whoever earned it, and
+the victim never observes the difference because a payment that succeeds looks identical either way.
+
+**Privacy: the claim is public by design.** A PEX record is gossiped to every peer that learns of the
+advertised peer and is relayed second- and third-hand, so `address` and `spki` MUST be treated as
+published to the whole network. `spki` reveals nothing new — it is the same public key the peer
+presents in its TLS certificate on every connection — but the claim does publicly and durably link a
+`peer_id` to an on-chain address whose activity is observable by anyone. A peer that does not wish to
+publish a payout address MUST omit the `payment` object; an embedder SHOULD populate it only from an
+explicitly configured payout address and MUST give the operator a way to leave it unset. Receivers
+MUST NOT treat the absence of a claim as a fault (§3.4.3).
+
+#### 3.4.1 Canonical signing bytes
+
+The signature covers exactly, with no separators other than those shown:
+
+```text
+"dig-pex/payment-address/v1\0"
+  || u32be(len(peer_id))    || peer_id
+  || u32be(len(network_id)) || network_id
+  || u32be(len(address))    || address
+```
+
+All strings are UTF-8; lengths are byte counts. The context string domain-separates the signature
+from every other DIG protocol, and the length prefixes make the encoding injective, so no two
+different field triples produce the same bytes.
+
+A valid signature proves that **the holder of the private key whose SPKI hashes to `peer_id`
+designated this address as its payee on this network**. It does NOT prove the peer is reachable or
+honest, that the address is well-formed or spendable, that the claim is recent, or that it has not
+been superseded by a newer claim the verifier has not seen.
+
+`last_seen` is deliberately NOT covered. Including it would expire the signature on the advertiser's
+next heartbeat, requiring the advertised peer to re-sign continuously and the advertiser to obtain a
+signature it cannot produce itself — an availability dependency on the very peer the record exists to
+route around. The cost of excluding it is that a revoked address stays verifiable until a newer claim
+propagates; a consumer SHOULD therefore prefer the claim on the freshest first-hand record.
+
+#### 3.4.2 Caps
+
+| Field | Cap |
+|---|---|
+| `address` | 128 characters (`PEX_MAX_PAYMENT_ADDRESS_LEN`) |
+| `spki` | 512 base64 characters (`PEX_MAX_PAYMENT_SPKI_LEN`) |
+| `sig` | 256 base64 characters (`PEX_MAX_PAYMENT_SIG_LEN`) |
+
+An entry whose `payment` exceeds any cap is skipped (§3.3). This is a size verdict only.
+
+#### 3.4.3 Verification, and the two verdicts on one record
+
+A verifier that wishes to pay a peer MUST, in order:
+
+1. check every field is within its cap and `spki` / `sig` are valid base64;
+2. recompute **`SHA-256(spki) == peer_id`** — this is what makes the record self-proving, since
+   `peer_id` is defined as `SHA-256(TLS SPKI DER)` (§2). No directory, resolution step or additional
+   trust root is consulted, which matters because the parties most needing to check a claim (relays,
+   and any node holding the record second- or third-hand) are the least likely to have one;
+3. verify `sig` over §3.4.1's bytes using the key in `spki`.
+
+**Reachability and payability are different verdicts on one record.** An entry whose claim is absent,
+malformed or unverifiable remains a perfectly good dial hint and MUST still be usable as one — making
+a bad claim cost a peer its reachability would hand a relaying attacker a way to partition it. An
+implementation MUST NOT expose an unverified payee to a caller.
+
+Signature verification is the embedder's primitive (DIG node certificates are ECDSA P-256 today), but
+the `peer_id` binding of step 2 MUST be performed by the PEX implementation itself, so that a
+permissive verifier cannot be induced to name the wrong payee.
+
+#### 3.4.4 Relation to provenance
+
+A signed claim is self-proving and is therefore NOT subject to the re-flooding concern of §8.1 —
+relaying it cannot corrupt it. This does **not** relax the §8.1 rule: an entry learned via PEX still
+has no legitimate `via` to claim and is still never re-advertised until independently verified. The
+re-flooding rule is about the *record*, not about the claim inside it, and is unchanged.
 
 ## 4 · Messages
 
@@ -340,6 +429,9 @@ plausibly have violated — never an unbounded or immediate escalation to `PEX_M
 | `PEX_MAX_ADDRESSES` | `8` | Max `addresses` per peer entry. |
 | `PEX_MAX_FLAGS` | `8` | Max `flags` per peer entry (and per handshake). |
 | `PEX_MAX_FLAG_LEN` | `32` | Max characters per flag token. |
+| `PEX_MAX_PAYMENT_ADDRESS_LEN` | `128` | Max characters in `payment.address` (§3.4.2). |
+| `PEX_MAX_PAYMENT_SPKI_LEN` | `512` | Max base64 characters in `payment.spki` (§3.4.2). |
+| `PEX_MAX_PAYMENT_SIG_LEN` | `256` | Max base64 characters in `payment.sig` (§3.4.2). |
 | `PEX_MAX_FRAME` | `262144` | Max message body bytes (256 KiB) — matches the DHT wire bound. |
 | `PEX_DEFAULT_INTERVAL` | `60` s | Default declared send interval. |
 | `PEX_MIN_INTERVAL` | `30` s | Hard interval floor (sender MUST, receiver enforces). |
@@ -363,6 +455,13 @@ plausibly have violated — never an unbounded or immediate escalation to `PEX_M
 - **Sender level:** a sender MUST cap its own messages: excess pending changes queue for
   subsequent deltas (§9.1); a first-hand set larger than the snapshot cap sends the freshest 200
   and lets the remainder flow as later `added` entries.
+  A sender MUST ALSO bound its messages by **encoded bytes**, not by entry count alone: the entry
+  count caps are a proxy, and they stopped implying the frame bound once entries could carry a signed
+  payment address (§3.4). Two hundred maximal entries encode to ~214 KB without a claim and ~281 KB
+  with one, against a 256 KiB frame — so a count-only sender would emit a frame every conformant
+  receiver is required to reject, and be struck for it. A sender therefore drops trailing (least
+  fresh) entries until the encoded message fits `PEX_MAX_FRAME`; the remainder flows as later
+  `added` entries (§9.1).
 
 ### 7.3 Malformed content
 

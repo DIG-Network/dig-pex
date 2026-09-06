@@ -22,6 +22,10 @@
 //! - **Not a gossip flood.** A participant advertises only what it knows **first-hand**; the
 //!   [`Provenance`] type has no `"pex"` token, so a PEX-learned entry can never be re-advertised
 //!   until independently verified.
+//! - **Not a payment authority.** An entry MAY carry a self-signed payment address
+//!   ([`PeerEntry::verified_payment_address`], SPEC §3.4) so the incentive layer can pay the peer
+//!   that earned it. The claim proves itself — it carries the peer's TLS SPKI and a signature this
+//!   crate binds to `peer_id` — but PEX neither holds keys nor moves money.
 //! - **Not content discovery.** Locating which peers hold content is the DHT's job (`dig-dht`); PEX
 //!   populates the pool of dialable peers underneath it.
 //!
@@ -76,6 +80,7 @@ pub mod caps;
 pub mod engine;
 pub mod entry;
 pub mod error;
+pub mod payment;
 pub mod state;
 pub mod timer;
 pub mod wire;
@@ -88,5 +93,9 @@ pub use caps::{
 pub use engine::{PexConfig, PexEngine, PexEvent, PexOutcome};
 pub use entry::{Address, AddressKind, PeerEntry, Provenance, ValidateCtx};
 pub use error::{EntrySkip, PexErrorCode};
+pub use payment::{
+    payment_signing_bytes, peer_id_for_spki, PaymentClaim, PaymentClaimError, SignatureVerifier,
+    PEX_MAX_PAYMENT_ADDRESS_LEN, PEX_MAX_PAYMENT_SIG_LEN, PEX_MAX_PAYMENT_SPKI_LEN,
+};
 pub use state::{LinkState, RecvPhase};
 pub use wire::PexMessage;

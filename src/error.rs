@@ -79,6 +79,10 @@ pub enum EntrySkip {
     BadVia,
     /// `last_seen` is more than `PEX_MAX_ENTRY_AGE` seconds in the past by the receiver's clock.
     TooOld,
+    /// The `payment` claim exceeded one of its field caps (SPEC §3.4.2). Note this is a *size*
+    /// verdict only: an entry whose claim is merely unverifiable is kept and stays dialable — it is
+    /// simply unpayable (SPEC §3.4.3).
+    OversizePayment,
 }
 
 #[cfg(test)]

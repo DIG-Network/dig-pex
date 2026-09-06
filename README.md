@@ -29,6 +29,22 @@ its reference implementation.
 - **Not content discovery.** Locating which peers hold content is the DHT's job (`dig-dht`); PEX
   populates the pool of dialable peers underneath it.
 
+## Paying a peer
+
+An entry MAY carry a **self-signed payment address** (SPEC 3.4) so the incentive layer can address
+$DIG to the peer that earned it. It is signed because PEX records are relayed: an unauthenticated
+payee pays whoever last forwarded the record, invisibly. The claim is public by design — it travels to every peer — so a node publishes one only when its operator has configured a payout address (SPEC 3.4).
+
+The claim carries the peer's TLS SPKI DER and a signature binding `peer_id`, `network_id` and the
+address. Since `peer_id` is `SHA-256(SPKI DER)`, a verifier recomputes that hash and checks the
+signature — the record proves itself, with no directory lookup and no second identity concept. Read
+it with `PeerEntry::verified_payment_address`, passing a signature verifier for the peer's key type;
+there is deliberately no way to obtain an unverified payee.
+
+Reachability and payability are separate verdicts: an entry whose claim does not verify is still a
+good dial hint, because letting a corrupted payee cost a peer its reachability would hand a relaying
+attacker a way to partition it.
+
 ## The four messages
 
 | `type` | Purpose |
@@ -79,7 +95,10 @@ let deltas = engine.tick(now_ms);
   sender costs a receiver at most one bounded frame per interval before it is muted.
 - **`#![forbid(unsafe_code)]`**, `#![warn(missing_docs)]`, strict clippy, ≥80% line coverage gated
   in CI (currently ~98%).
-- **Minimal dependencies** — `serde` / `serde_json` / `tokio` / `rand`. The peer entry is *mirrored*
+- **Minimal dependencies** — `serde` / `serde_json` / `tokio` / `rand` / `sha2` / `base64`.
+  Signature verification is an *injected capability* (`SignatureVerifier`), so the crate stays sans-IO
+  and carries no signature crypto; only the `peer_id` = `SHA-256(SPKI)` binding is computed here,
+  because delegating that would let a permissive verifier name the wrong payee. The peer entry is *mirrored*
   from (byte-compatible with) the L7 `dig.getPeers` / dig-nat / dig-gossip `Contact` shape rather
   than importing those crates, to keep the tree small.
 
