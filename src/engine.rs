@@ -17,6 +17,7 @@
 //! Timestamps are **Unix epoch milliseconds**. See [`crate`] docs for the node vs relay embedding.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::caps::frame_within_bound;
 use crate::caps::{
@@ -25,12 +26,13 @@ use crate::caps::{
 };
 use crate::entry::{PeerEntry, ValidateCtx};
 use crate::error::PexErrorCode;
+use crate::payment::{peer_id_for_spki, PaymentClaim, PaymentClaimError, SignatureVerifier};
 use crate::state::{LinkState, RecvPhase};
 use crate::timer::{arrival_floor_ms, clamp_interval, effective_interval_secs, jitter_ms};
 use crate::wire::PexMessage;
 
 /// Configuration for a [`PexEngine`] (SPEC Appendix A).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PexConfig {
     /// This participant's own transport identity (`peer_id`, `<64hex>`) — excluded from every
     /// advertisement and used to skip self-entries on receive (SPEC §5.4).
@@ -46,11 +48,20 @@ pub struct PexConfig {
     /// Whether to add SPEC §6.3 send jitter. Default `true`; tests may disable it for deterministic
     /// scheduling (0% jitter is within the allowed `0..+10%`).
     pub jitter: bool,
+    /// This participant's own signed payment claim (SPEC §4.2.1), carried on every outgoing
+    /// `pex_handshake`. `None` (the default) sends no `payment` field at all — an ordinary and
+    /// complete conformance state (rule 9). Set only via [`try_with_payment`](Self::try_with_payment),
+    /// which refuses a claim that cannot possibly be this participant's own.
+    pub own_payment: Option<PaymentClaim>,
+    /// The signature primitive for verifying an **inbound** handshake's `payment` claim (SPEC
+    /// §4.2.1 rule 3). `None` means "no verifier configured": every inbound claim is dropped
+    /// unverified, never stored, and PEX otherwise runs normally (rule 5).
+    pub payment_verifier: Option<Arc<dyn SignatureVerifier>>,
 }
 
 impl PexConfig {
     /// A new config for `local_peer_id` on `network_id`, with the default 60 s interval, no flags,
-    /// and jitter enabled.
+    /// jitter enabled, and no payment claim / verifier configured.
     #[must_use]
     pub fn new(local_peer_id: impl Into<String>, network_id: impl Into<String>) -> Self {
         PexConfig {
@@ -59,6 +70,8 @@ impl PexConfig {
             flags: Vec::new(),
             interval: crate::caps::PEX_DEFAULT_INTERVAL,
             jitter: true,
+            own_payment: None,
+            payment_verifier: None,
         }
     }
 
@@ -81,6 +94,49 @@ impl PexConfig {
     pub fn with_jitter(mut self, jitter: bool) -> Self {
         self.jitter = jitter;
         self
+    }
+
+    /// Builder: attach this participant's own signed payment claim, carried on every outgoing
+    /// handshake (SPEC §4.2.1 rule 9). Refused **at configuration time** — never at send time —
+    /// when `claim`'s `spki` does not hash to `local_peer_id`, or the claim exceeds a §3.4.2 cap, so
+    /// a misconfigured claim can never leave the node.
+    ///
+    /// # Errors
+    /// [`PaymentClaimError::Malformed`] over a cap; [`PaymentClaimError::PeerIdMismatch`] when the
+    /// claim's key is not this participant's own.
+    pub fn try_with_payment(mut self, claim: PaymentClaim) -> Result<Self, PaymentClaimError> {
+        if !claim.within_caps() {
+            return Err(PaymentClaimError::Malformed);
+        }
+        if peer_id_for_spki(&claim.spki_der()) != self.local_peer_id {
+            return Err(PaymentClaimError::PeerIdMismatch);
+        }
+        self.own_payment = Some(claim);
+        Ok(self)
+    }
+
+    /// Builder: set the signature primitive used to verify an inbound handshake's `payment` claim
+    /// (SPEC §4.2.1 rule 3). Without one, every inbound claim is dropped unverified (rule 5).
+    #[must_use]
+    pub fn with_payment_verifier(mut self, verifier: Arc<dyn SignatureVerifier>) -> Self {
+        self.payment_verifier = Some(verifier);
+        self
+    }
+}
+
+// Manual `Debug`: `dyn SignatureVerifier` carries no `Debug` impl (it may close over key material),
+// so the verifier is shown only as present/absent, never its contents.
+impl std::fmt::Debug for PexConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PexConfig")
+            .field("local_peer_id", &self.local_peer_id)
+            .field("network_id", &self.network_id)
+            .field("flags", &self.flags)
+            .field("interval", &self.interval)
+            .field("jitter", &self.jitter)
+            .field("own_payment", &self.own_payment)
+            .field("payment_verifier", &self.payment_verifier.is_some())
+            .finish()
     }
 }
 
@@ -127,6 +183,9 @@ struct ReceivedHint {
     last_seen: u64,
 }
 
+/// `(known_epoch, claims_epoch, now_secs, list)` — the shape `PexEngine`'s advertisable cache stores.
+type AdvertisableCacheEntry = (u64, u64, u64, Vec<PeerEntry>);
+
 /// The transport-agnostic PEX engine (SPEC Appendix A). One instance per participant; it multiplexes
 /// all of that participant's links.
 #[derive(Debug)]
@@ -143,10 +202,18 @@ pub struct PexEngine {
     /// optimization: the freshest-first, self-excluded base list is identical across every link
     /// within one tick, so it is computed once and reused rather than per-link).
     known_epoch: u64,
+    /// Verified inbound-handshake payment claims (SPEC §4.2.1 rule 6), keyed by `peer_id`, at most
+    /// one per peer, held by the PEX implementation itself rather than by the embedder. Only ever
+    /// advanced by a claim that passed [`PaymentClaim::verify`] against the *link's* identity — a
+    /// failed claim never enters or overwrites this map (rule 6).
+    claims: HashMap<String, PaymentClaim>,
+    /// Bumped whenever `claims` is mutated — invalidates `advertisable_cache` alongside
+    /// `known_epoch`, so a stored/replaced/discarded claim re-advertises at the next delta (rule 8).
+    claims_epoch: u64,
     /// The cached partner-independent advertisable base list (self excluded, stale dropped,
-    /// freshest-first) — `(epoch it was built at, the `now_secs` it was built for, the list)`.
-    /// Recomputed only when `known_epoch` or `now_secs` has moved since the cached build.
-    advertisable_cache: std::cell::RefCell<Option<(u64, u64, Vec<PeerEntry>)>>,
+    /// freshest-first, stored claims applied) — `(known_epoch, claims_epoch, now_secs, list)` it was
+    /// built at/for. Recomputed only when either epoch or `now_secs` has moved since the cached build.
+    advertisable_cache: std::cell::RefCell<Option<AdvertisableCacheEntry>>,
     /// Test-only instrumentation (#179 MED): counts actual `advertisable_base` rebuilds, so a test
     /// can assert the cache is hit (O(1) rebuild per tick) rather than only checking behavioral
     /// equivalence, which a naive per-link recompute would also satisfy.
@@ -164,6 +231,8 @@ impl PexEngine {
             links: HashMap::new(),
             hints: HashMap::new(),
             known_epoch: 0,
+            claims: HashMap::new(),
+            claims_epoch: 0,
             advertisable_cache: std::cell::RefCell::new(None),
             #[cfg(test)]
             advertisable_rebuilds: std::cell::Cell::new(0),
@@ -190,6 +259,9 @@ impl PexEngine {
     pub fn remove_known(&mut self, peer_id: &str) {
         self.known.remove(peer_id);
         self.known_epoch = self.known_epoch.wrapping_add(1);
+        // SPEC §4.2.1 rule 7: a stored claim outlives first-hand knowledge only while the link is
+        // still up; with no link either, both lifetime conditions have ceased.
+        self.discard_claim_if_both_conditions_ceased(peer_id);
     }
 
     // ----- link lifecycle (SPEC §5) -----
@@ -205,6 +277,7 @@ impl PexEngine {
             network_id: self.cfg.network_id.clone(),
             interval,
             flags: self.cfg.flags.clone(),
+            payment: self.cfg.own_payment.clone(),
         };
 
         // Build the snapshot from the current advertisable set (freshest-first, capped, self+partner
@@ -239,6 +312,9 @@ impl PexEngine {
     pub fn link_down(&mut self, peer_id: &str) {
         self.links.remove(peer_id);
         self.hints.retain(|_, h| h.source != peer_id);
+        // SPEC §4.2.1 rule 7: the claim outlives link teardown only while the peer stays first-hand
+        // known; with no first-hand entry either, both lifetime conditions have ceased.
+        self.discard_claim_if_both_conditions_ceased(peer_id);
     }
 
     // ----- inbound (SPEC §5.3, §6.4, §7, §11) -----
@@ -267,8 +343,9 @@ impl PexEngine {
                 version,
                 network_id,
                 interval: declared,
+                payment,
                 ..
-            } => self.on_handshake(peer_id, version, &network_id, declared),
+            } => self.on_handshake(peer_id, version, &network_id, declared, payment),
             PexMessage::PexSnapshot { peers } => self.on_snapshot(peer_id, peers, now_ms),
             PexMessage::PexDelta { added, dropped } => {
                 self.on_delta(peer_id, added, dropped, now_ms)
@@ -449,6 +526,7 @@ impl PexEngine {
         version: u32,
         network_id: &str,
         declared: u32,
+        payment: Option<PaymentClaim>,
     ) -> PexOutcome {
         let phase = self.links[peer_id].phase;
         if phase != RecvPhase::AwaitingHandshake {
@@ -464,7 +542,42 @@ impl PexEngine {
         let link = self.links.get_mut(peer_id).expect("link exists");
         link.remote_declared_secs = Some(clamp_interval(declared));
         link.phase = RecvPhase::AwaitingSnapshot;
+
+        // SPEC §4.2.1 rules 2-5: only on an ACCEPTED handshake (state/version/network already
+        // proven above) do we verify the sender's own claim against the *link's* mTLS peer_id —
+        // never a wire field. A failure here costs only the claim: no strike, no mute, no effect on
+        // the handshake just accepted (rule 4); no verifier configured means no payee (rule 5).
+        if let Some(claim) = payment {
+            if let Some(verifier) = self.cfg.payment_verifier.clone() {
+                if claim.verify(peer_id, network_id, &verifier).is_ok() {
+                    self.store_claim(peer_id, claim);
+                }
+                // Malformed / peer_id mismatch / bad signature: dropped silently. A failed claim
+                // MUST NOT replace a stored verified one (rule 6) — and it does not, since we only
+                // ever call `store_claim` on the `Ok` arm above.
+            }
+        }
+
         PexOutcome::default()
+    }
+
+    /// Replace the verified claim stored for `peer_id` (SPEC §4.2.1 rule 6: a claim newly verified
+    /// replaces any previous one; a claim that fails verification never reaches this method). Bumps
+    /// `claims_epoch` so the entry re-advertises to any link already told it (rule 8).
+    fn store_claim(&mut self, peer_id: &str, claim: PaymentClaim) {
+        self.claims.insert(peer_id.to_string(), claim);
+        self.claims_epoch = self.claims_epoch.wrapping_add(1);
+    }
+
+    /// SPEC §4.2.1 rule 7: a stored claim is retained while *either* the link is up *or* the peer is
+    /// first-hand known; discard it only once both have ceased. Call after whichever of the two just
+    /// changed (`link_down` / `remove_known`) to check the other.
+    fn discard_claim_if_both_conditions_ceased(&mut self, peer_id: &str) {
+        let link_up = self.links.contains_key(peer_id);
+        let first_hand = self.known.contains_key(peer_id);
+        if !link_up && !first_hand && self.claims.remove(peer_id).is_some() {
+            self.claims_epoch = self.claims_epoch.wrapping_add(1);
+        }
     }
 
     fn on_snapshot(&mut self, peer_id: &str, peers: Vec<PeerEntry>, now_ms: u64) -> PexOutcome {
@@ -695,6 +808,7 @@ fn evict_oldest<V>(map: &mut HashMap<String, V>, last_seen: impl Fn(&V) -> u64) 
 /// this and applies the cheap per-link partner exclusion (#179 MED optimization).
 fn advertisable_base(
     known: &HashMap<String, PeerEntry>,
+    claims: &HashMap<String, PaymentClaim>,
     local_peer_id: &str,
     now_secs: u64,
 ) -> Vec<PeerEntry> {
@@ -706,6 +820,16 @@ fn advertisable_base(
             e.last_seen >= now_secs || now_secs - e.last_seen <= crate::caps::PEX_MAX_ENTRY_AGE
         })
         .cloned()
+        .map(|mut e| {
+            // SPEC §4.2.1 rule 6 precedence: a claim this PEX implementation itself verified for
+            // this peer overrides whatever the embedder attached to the entry — it is the only one
+            // actually checked against the link identity. No stored claim → leave as-is (the
+            // embedder's own claim, verified or not, is the receiving end's problem, §3.4.3).
+            if let Some(claim) = claims.get(&e.peer_id) {
+                e.payment = Some(claim.clone());
+            }
+            e
+        })
         .collect();
     out.sort_by(|a, b| {
         b.last_seen
@@ -717,29 +841,35 @@ fn advertisable_base(
 
 impl PexEngine {
     /// The partner-independent advertisable base list for `now_secs`, computed once and reused for
-    /// every link (#179 MED optimization): freshest-first, self excluded, stale dropped. Cached in
-    /// `advertisable_cache` and only recomputed when `known_epoch` (bumped by
-    /// [`upsert_known`](Self::upsert_known)/[`remove_known`](Self::remove_known)) or `now_secs` has
-    /// moved since the cached build — so `L` links in one `tick` share a single O(K log K) build
-    /// instead of each paying it, where `K = known.len()`.
+    /// every link (#179 MED optimization): freshest-first, self excluded, stale dropped, stored
+    /// claims applied (SPEC §4.2.1 rule 6). Cached in `advertisable_cache` and only recomputed when
+    /// `known_epoch` / `claims_epoch` (bumped by [`upsert_known`](Self::upsert_known) /
+    /// [`remove_known`](Self::remove_known) / [`store_claim`](Self::store_claim) /
+    /// [`discard_claim_if_both_conditions_ceased`](Self::discard_claim_if_both_conditions_ceased)) or
+    /// `now_secs` has moved since the cached build — so `L` links in one `tick` share a single
+    /// O(K log K) build instead of each paying it, where `K = known.len()`.
     fn advertisable_cached(&self, now_secs: u64) -> std::cell::Ref<'_, Vec<PeerEntry>> {
         {
             let cache = self.advertisable_cache.borrow();
-            if let Some((epoch, cached_secs, _)) = cache.as_ref() {
-                if *epoch == self.known_epoch && *cached_secs == now_secs {
+            if let Some((k_epoch, c_epoch, cached_secs, _)) = cache.as_ref() {
+                if *k_epoch == self.known_epoch
+                    && *c_epoch == self.claims_epoch
+                    && *cached_secs == now_secs
+                {
                     drop(cache);
                     return std::cell::Ref::map(self.advertisable_cache.borrow(), |c| {
-                        &c.as_ref().unwrap().2
+                        &c.as_ref().unwrap().3
                     });
                 }
             }
         }
-        let fresh = advertisable_base(&self.known, &self.cfg.local_peer_id, now_secs);
+        let fresh = advertisable_base(&self.known, &self.claims, &self.cfg.local_peer_id, now_secs);
         #[cfg(test)]
         self.advertisable_rebuilds
             .set(self.advertisable_rebuilds.get() + 1);
-        *self.advertisable_cache.borrow_mut() = Some((self.known_epoch, now_secs, fresh));
-        std::cell::Ref::map(self.advertisable_cache.borrow(), |c| &c.as_ref().unwrap().2)
+        *self.advertisable_cache.borrow_mut() =
+            Some((self.known_epoch, self.claims_epoch, now_secs, fresh));
+        std::cell::Ref::map(self.advertisable_cache.borrow(), |c| &c.as_ref().unwrap().3)
     }
 
     /// Test-only: how many times the advertisable base list has actually been rebuilt (#179 MED) —

@@ -4,8 +4,8 @@
 //! driven directly — with NO real network. Each test names the conformance id(s) it guards.
 
 use dig_pex::{
-    Address, AddressKind, PeerEntry, PexConfig, PexEngine, PexErrorCode, PexEvent, PexMessage,
-    Provenance, PEX_MAX_ADDED, PEX_MAX_SNAPSHOT, PEX_VERSION,
+    Address, AddressKind, PaymentClaim, PeerEntry, PexConfig, PexEngine, PexErrorCode, PexEvent,
+    PexMessage, Provenance, PEX_MAX_ADDED, PEX_MAX_SNAPSHOT, PEX_VERSION,
 };
 
 fn hex(b: u8) -> String {
@@ -31,6 +31,18 @@ fn engine(local: &str, net: &str) -> PexEngine {
 /// Deliver an inbound handshake for `sender` into `eng`, transitioning its receiver to
 /// `AwaitingSnapshot`.
 fn deliver_handshake(eng: &mut PexEngine, sender: &str, net: &str, interval: u32) {
+    deliver_handshake_with_payment(eng, sender, net, interval, None);
+}
+
+/// Same as [`deliver_handshake`] but lets a test carry the sender's own `payment` claim (SPEC
+/// §4.2.1) through the real inbound path — never call the engine's private claim store directly.
+fn deliver_handshake_with_payment(
+    eng: &mut PexEngine,
+    sender: &str,
+    net: &str,
+    interval: u32,
+    payment: Option<PaymentClaim>,
+) {
     let out = eng.on_message(
         sender,
         PexMessage::PexHandshake {
@@ -38,6 +50,7 @@ fn deliver_handshake(eng: &mut PexEngine, sender: &str, net: &str, interval: u32
             network_id: net.to_string(),
             interval,
             flags: vec![],
+            payment,
         },
         1_000_000,
     );
@@ -614,6 +627,7 @@ fn unsupported_version_mutes_without_a_strike() {
             network_id: "mainnet".into(),
             interval: 60,
             flags: vec![],
+            payment: None,
         },
         1_000_000,
     );
@@ -646,6 +660,7 @@ fn network_mismatch_mutes_without_a_strike() {
             network_id: "testnet".into(),
             interval: 60,
             flags: vec![],
+            payment: None,
         },
         1_000_000,
     );

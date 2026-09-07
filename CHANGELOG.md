@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.3.0] - 2026-09-07
+
+### Features
+- **handshake:** Carry the sender's own signed payment claim on `pex_handshake` (SPEC §4.2.1,
+  PEX-17..23) — a `payment` field, verified against the link's mTLS identity, stored by the PEX
+  implementation itself and applied with precedence over any embedder-attached claim when the peer
+  is advertised (#3133)
+
 ## [0.2.0] - 2026-09-06
 
 ### Features
