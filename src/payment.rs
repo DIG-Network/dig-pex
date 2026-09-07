@@ -94,6 +94,16 @@ where
     }
 }
 
+/// Lets an `Arc<dyn SignatureVerifier>` (the shape [`crate::PexConfig::with_payment_verifier`]
+/// stores, since a config is `Clone` and the trait itself is not) be handed anywhere a
+/// `&impl SignatureVerifier` is expected — e.g. [`PaymentClaim::verify`] — without a second,
+/// duplicate signing-verification codepath.
+impl SignatureVerifier for std::sync::Arc<dyn SignatureVerifier> {
+    fn verify(&self, spki_der: &[u8], message: &[u8], signature: &[u8]) -> bool {
+        (**self).verify(spki_der, message, signature)
+    }
+}
+
 /// Why a claim did not yield a payment address. Every variant means the same thing to a caller —
 /// **there is no payee here** — and they differ only in what to log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -217,6 +217,12 @@ relaying it cannot corrupt it. This does **not** relax the §8.1 rule: an entry 
 has no legitimate `via` to claim and is still never re-advertised until independently verified. The
 re-flooding rule is about the *record*, not about the claim inside it, and is unchanged.
 
+The one channel on which a claim is *not* merely relayed is the sender's own `pex_handshake`
+(§4.2.1): there the claim arrives first-hand from the peer it names, over a link whose mTLS identity
+is exactly the `peer_id` the claim must bind to. That is what lets a receiver attach it to that
+peer's entry and re-advertise it without violating §8.1 — the entry is advertisable because the
+receiver connected to the peer, and the claim is attachable because the same link proved whose it is.
+
 ## 4 · Messages
 
 ### 4.1 Encoding & framing
@@ -247,6 +253,158 @@ The first PEX message a participant sends on a link, in each direction, before a
 | `network_id` | string | REQUIRED. The sender's network. MUST match the receiver's, else §5.2. |
 | `interval` | uint | REQUIRED. Seconds — the sender's declared minimum spacing between its own data messages on this link (§6). MUST be within `[30, 3600]`; a receiver clamps out-of-range values into that range for enforcement. |
 | `flags` | array | OPTIONAL (default `[]`). The **sender's own** capability flags (§3.2 tokens). |
+| `payment` | object | OPTIONAL (default absent). The **sender's own** signed payment claim, in the §3.4 shape and no other. Its `spki` MUST hash to the sender's mTLS `peer_id` on this link. Carriage, provenance, verification, storage and re-advertisement are governed entirely by §4.2.1. |
+
+A handshake carrying a claim:
+
+```json
+{ "type": "pex_handshake", "version": 1, "network_id": "mainnet", "interval": 60,
+  "flags": ["storage"],
+  "payment": { "address": "xch1...", "spki": "<base64 of the sender's TLS SPKI DER>",
+               "sig": "<base64 signature over the canonical bytes of §3.4.1>" } }
+```
+
+`payment` was added in crate version **0.3.0**. The wire `version` stays **`1`**: the field is
+purely additive, and a version-1 receiver that does not know it MUST ignore it (§2). A sender MUST
+NOT bump `version` on account of this field — a handshake declaring `version: 2` is muted with
+`pex_error` code `2` by every conformant receiver (§5.2), so bumping it would break exactly the
+interoperability the additive shape preserves.
+
+#### 4.2.1 The sender's own payment claim (`payment`)
+
+§3.4 defines a signed payment claim that may ride on a `PeerEntry`, but leaves open how a peer's own
+claim reaches the peers that advertise it. Entries are advertised by *other* participants, and §8.1
+forbids re-advertising anything learned via PEX, so a peer cannot inject its claim into the gossip by
+sending an entry about itself (§5.4 forbids that too). The handshake is the one message a peer sends
+*as itself* on an authenticated link, so it is the channel: a participant states its own payee once
+per link, to the peer that will advertise it.
+
+Every rule in this section is **specified, not yet implemented** as of the 0.3.0 development head
+except where the status table at the end of this section cites an implementation.
+
+**(1) The claim is the §3.4 type, and it is the sender's own.** A `payment` on a `pex_handshake`
+MUST be the object of §3.4 — the same three fields, the same §3.4.1 signing bytes, the same §3.4.2
+caps — and MUST NOT be a bare address or any other shape. It asserts *the sender's* payee. A sender
+MUST NOT place another peer's claim on its handshake, and a receiver MUST NOT attach a handshake
+claim to any entry other than the sending peer's own.
+
+**(2) `peer_id` binding is to the link, not to a wire field.** The `peer_id` a claim is verified
+against is the link's mTLS peer identity supplied by the host — never a field of any PEX message
+(PEX-12, §11.1). A receiver MUST verify `SHA-256(claim.spki) == link_peer_id` and MUST reject the
+claim when it differs. The `network_id` used for verification is the link's, which the §5.2 check
+has already proven equal to the receiver's own; a receiver MUST NOT verify against any other
+network.
+
+**(3) Verification happens before storage and before re-advertisement.** A receiver MUST run the
+full §3.4.3 order — caps, then base64 decodability, then the `SHA-256(spki) == peer_id` binding
+(performed by the PEX implementation itself, never delegated), then the signature over §3.4.1's
+bytes using the embedder-supplied primitive — and MUST complete it successfully **before** the
+claim is stored, attached to an entry, or included in any outgoing message. A receiver MUST NOT
+store an unverified claim for later verification, and MUST NOT synthesize, repair, re-encode or
+re-sign a claim under any circumstances.
+
+**(4) A failed claim costs the claim and nothing else.** A claim that fails for any reason — over
+caps, undecodable, `peer_id` mismatch, bad signature, or no verifier configured — MUST be dropped,
+and the handshake MUST otherwise be processed exactly as if no `payment` field had been present:
+no `pex_error`, no strike, no mute, no effect on the link's phase, interval or flags. Two reasons
+this direction is normative rather than discretionary: §3.4.3 already rules that payability never
+costs reachability, and the failure mode of striking is that an embedder with a missing or wrong
+verifier would mute the PEX of every honest neighbour it has — a self-inflicted partition triggered
+by a purely local misconfiguration.
+
+**(5) No verifier configured means no payee.** A receiver with no signature verifier configured
+MUST treat every claim as unverified: it MUST NOT store one, MUST NOT expose one, and MUST NOT
+attach one to an entry it advertises. It MUST continue to run PEX normally in both directions. This
+is fail-closed on payability and fail-open on reachability — the same asymmetry as §3.4.3.
+
+**(6) The PEX implementation owns the store; the embedder writes no carriage code.** Verified
+neighbour claims are held by the PEX implementation itself, keyed by `peer_id`, at most one per
+peer, and are attached to that peer's entry when the implementation advertises it. An embedder MUST
+NOT be required to move a claim from a handshake onto a `PeerEntry`, and a conforming implementation
+MUST NOT require it to. Three consequences:
+
+- **Replacement.** A newly verified claim for a peer replaces any claim stored for that peer. A
+  claim that fails verification MUST NOT replace or remove a stored verified one — the store is only
+  ever advanced by a claim that verifies. A stored claim therefore proves what the peer designated
+  when it last successfully handshook, not what it designates now (§3.4.1).
+- **Precedence.** When a verified claim is stored for a peer, it MUST take precedence over any claim
+  the embedder attached to that peer's entry, because it is the only one the PEX implementation has
+  itself verified against the link identity. When no verified claim is stored, an
+  embedder-attached claim MUST be left on the entry unchanged and advertised as-is; verifying it is
+  the receiving end's job (§3.4.3).
+- **Storing a claim is not knowing a peer.** Storing a claim MUST NOT create, refresh or extend an
+  entry in the first-hand set. Only an mTLS-verified connection or the participant's own introducer
+  role makes a peer first-hand-known (§8.1); a peer with a stored claim and no first-hand entry is
+  not advertisable, and its claim goes nowhere.
+
+**(7) Lifetime.** A stored claim is retained exactly as long as **either** the link that delivered it
+is up **or** the peer has an entry in the first-hand set. It MUST be discarded when both cease:
+removing the peer from the first-hand set discards it, and link teardown discards it *unless* the
+peer is still in the first-hand set — in which case the entry stays advertisable for up to
+`PEX_MAX_ENTRY_AGE` after disconnect (§8.2) and MUST keep its claim for that whole window, since
+dropping it would silently stop paying a peer that is still being advertised. Per-link told-state
+still dies with the link (§5.5, §9.1); the claim store does not.
+
+**(8) Re-advertisement.** A claim newly stored, replaced or removed for a peer that has already been
+told to a link changes that entry's advertised content, so the entry MUST be re-advertised on that
+link as an `added` **update** at the next delta (§9.1, §4.4). The claim is part of the §9.1
+fingerprint. A claim is never carried in `dropped`, which is an array of `peer_id` strings (§4.4) —
+vacuously satisfied by the wire shape, and it MUST remain so.
+
+**(9) Sender-side configuration MUST refuse an unusable claim.** The API by which an embedder
+configures its own claim MUST refuse — at configuration time, not at send time — a claim whose
+`spki` does not hash to the participant's own `local_peer_id`, or which exceeds any §3.4.2 cap, so
+that a misconfigured claim never leaves the node. A participant that has configured no claim sends
+handshakes with no `payment` field, which is an ordinary and complete conformance state: a peer that
+does not wish to publish a payout address MUST be able to leave it unset (§3.4).
+
+**(10) Resource bounds.** This section introduces no new constant and no new unauthenticated
+surface. The claim is bounded by §3.4.2's existing caps, so a maximal handshake claim is at most 896
+characters of field content — under 1.1 KB of framed JSON against `PEX_MAX_FRAME` (262144), over
+two orders of magnitude below the frame cap. A claim can enter the store only through a handshake
+accepted on an already-authenticated link (§11.1), at most one per peer, and rule 7 discards it when
+the peer is neither connected nor known, so the store is bounded by the number of live links plus
+the size of the first-hand set (§11.3).
+
+**(11) Compatibility.** A `pex_handshake` carrying an unknown field decodes on a version-1 decoder —
+`src/wire.rs:263` (`unknown_fields_ignored_on_receive`) is exactly that case — so a dig-pex 0.2.x
+receiver ignores `payment` and completes the handshake normally, and a 0.3.0 sender interoperates
+with every 0.2.x peer with no negotiation and no capability flag. `PEX_VERSION` remains `1`
+(`src/caps.rs:9`). The claim's *presence* is not a capability signal and MUST NOT be read as one;
+capability flags are the §3.2 tokens in `flags` and nothing else.
+
+**(12) Relay binding.** These rules are per-**link**, not per-binding: a node's `pex_handshake` to a
+relay (§10.2) MAY carry its claim, and a relay MAY attach it under exactly the rules above, since the
+relay's registered connection is the authenticated link and registration is its first-hand evidence.
+`dig-relay` does not do so in this pass — its own SPEC §4 pins introducer entries to `payment`
+absent — so relay-advertised entries carry no claim and no relay-side behaviour is specified here.
+
+**What a reader MUST NOT conclude.** A verified claim proves only that the holder of the key whose
+SPKI hashes to this `peer_id` designated this address as its payee on this network (§3.4.1). It does
+NOT prove the peer is reachable, honest, or still connected; NOT that the address is well-formed,
+spendable, or on any particular chain; NOT that the claim is current or unsuperseded; and NOT that
+the peer earned anything. The absence of a claim is NOT a fault, NOT a downgrade, and MUST NOT
+affect reachability, strikes, muting, or an entry's usefulness as a dial hint (§3.4.3). A stored
+claim is NOT evidence that the link is still up. Receiving a claim does NOT make its sender
+first-hand-known (rule 6).
+
+**Implementation status of this section** — every row is a clause of this section against the code
+in the same unit of work:
+
+| Rule | Status |
+|---|---|
+| 1 — the §3.4 claim type | Implemented: `src/payment.rs:173` `PaymentClaim`, `:134` `payment_signing_bytes`, `:65`–`:73` the three caps. |
+| 1 — carriage on the handshake | Implemented: `PexMessage::PexHandshake.payment: Option<PaymentClaim>` (`src/wire.rs:57`), additive and omitted from the wire when unset. |
+| 2, 3 — binding + verification order | Implemented: `src/payment.rs:236` `PaymentClaim::verify` runs caps → base64 → `SHA-256(spki) == peer_id` → verifier, in that order, against the link's own `peer_id`/`network_id`. Applied on the handshake path at `src/engine.rs:523` `on_handshake`, after the phase/version/network_id checks accept the link. |
+| 4, 5 — no strike, fail closed | Implemented: `on_handshake` (`src/engine.rs:523`) only ever calls `store_claim` (`:567`) on a claim that verified; a failed claim is silently dropped with no event, reply, strike or mute, and with no `payment_verifier` configured (`PexConfig::payment_verifier`, `src/engine.rs:59`) no claim is ever stored. |
+| 6, 7 — store, precedence, lifetime | Implemented: `PexEngine.claims: HashMap<String, PaymentClaim>` (`src/engine.rs:209`), written only by `store_claim` (`:567`); `advertisable_base` overrides an entry's `payment` from `claims` before the embedder-attached value, giving the stored claim precedence. Lifetime: `discard_claim_if_both_conditions_ceased` (`:575`) is called from both `remove_known` (`:264`) and `link_down` (`:317`), and removes the claim only when neither the link nor first-hand knowledge remains. |
+| 8 — fingerprint includes the claim | Implemented: `src/entry.rs:312`–`317` and `:361`–`364` fold all three claim fields into both fingerprints. The delta-visibility half is implemented via `claims_epoch` (`src/engine.rs:212`), bumped by `store_claim`/`discard_claim_if_both_conditions_ceased` and included in the `advertisable_cache` key (`AdvertisableCacheEntry`), so a claim-only mutation invalidates the cache and re-advertises as `added` on the next delta even with no `known` mutation. |
+| 8 — never in `dropped` | Vacuously satisfied by the wire shape: `dropped` is an array of `peer_id` strings (§4.4). |
+| 9 — sender-side refusal | Implemented: `PexConfig::try_with_payment` (`src/engine.rs:107`) refuses (returns `Err`) an own claim that is over-caps or whose `spki` does not hash to the config's own `peer_id`, before it can ever be set. |
+| 10 — bounds | No new constant. §3.4.2's caps are implemented (`src/payment.rs:223` `within_caps`); the store bound is implemented structurally by rule 7's discard logic — a claim cannot outlive both its link and its first-hand entry, so the store is bounded by `links.len() + known.len()`. |
+| 11 — compatibility | Implemented and unchanged: `PEX_VERSION = 1` (`src/caps.rs:9`); `src/wire.rs:263` proves a version-1 decoder ignores an unknown handshake field. |
+| 12 — relay binding | Out of scope for this crate version; `dig-relay` unchanged. |
+| Negative clauses | Constraints on readers and consumers; nothing to implement. |
 
 ### 4.3 `pex_snapshot`
 
@@ -327,6 +485,14 @@ capability signal only (§10.2).
 - A receiver that gets a handshake whose `network_id` differs from its own MUST reply
   `pex_error` code `5` and mute the direction.
 - The handshake's `interval` and `flags` are recorded for the life of the link (§6).
+- The handshake's `payment` claim (§4.2.1), when present, is processed **only after the handshake
+  itself is accepted** — after the state check (§5.3), the `version` check and the `network_id`
+  check have all passed. A handshake muted for `version` (code `2`) or `network_id` (code `5`), or
+  struck as a state violation (code `6`), MUST NOT have its claim verified, stored, or attached to
+  anything.
+- A `payment` claim that fails verification MUST NOT produce a `pex_error`, a strike, or a mute.
+  It is dropped and the handshake is otherwise processed normally (§4.2.1 rule 4). Payability never
+  costs reachability (§3.4.3).
 
 ### 5.3 State machine (per direction, receiver's view)
 
@@ -510,8 +676,10 @@ misbehaved). It is **advisory, not authoritative**:
 ### 9.1 Per-link sender state ("what I've told you")
 
 Deltas are **relative to per-link history**. For each link, a sender keeps the set of `peer_id`s
-it has told this link, with a fingerprint of each entry's advertised content (addresses + flags —
-**not** `last_seen`, so heartbeat churn alone never re-advertises a peer):
+it has told this link, with a fingerprint of each entry's advertised content — its addresses, its
+flags, and its attached `payment` claim (all three wire fields), but **not** `last_seen`, so
+heartbeat churn alone never re-advertises a peer while a replaced or re-signed claim does
+(`src/entry.rs:312`, `src/entry.rs:361`):
 
 - an entry enters `added` when it is first-hand-known but not yet told, or told with a different
   fingerprint (an update);
@@ -520,6 +688,9 @@ it has told this link, with a fingerprint of each entry's advertised content (ad
 - changes beyond the per-message caps queue for subsequent deltas in deterministic order
   (freshest first for `added`);
 - told-state is per-link and dies with the link (§5.5).
+- a `payment` claim newly stored, replaced, or removed for an already-told peer changes that peer's
+  fingerprint and therefore enters `added` as an **update** on every link that was told it (§4.2.1
+  rule 8); a claim is never carried in `dropped`, which is an array of `peer_id` strings (§4.4).
 
 ### 9.2 Receiver state & dedup
 
@@ -638,6 +809,12 @@ of *distinct* `peer_id`s. The receiver-side accumulators this would otherwise gr
 (`PEX_MAX_RECEIVED_PER_LINK`, `PEX_MAX_HINTS`) with oldest-`last_seen` eviction, and are freed
 promptly on mute rather than left to accumulate until the connection closes (§9.2).
 
+The verified payment-claim store (§4.2.1 rules 6–7) is bounded on the same principle: a claim can
+enter it only through a handshake accepted on an already-authenticated link, at most one per peer,
+and it is discarded once the peer has neither a live link nor a first-hand entry — so it is bounded
+by the number of live links plus the size of the first-hand set, and adds no new unauthenticated
+growth surface (§4.2.1 rule 10). Its per-field size is bounded before decoding by §3.4.2's caps.
+
 ### 11.4 Eclipse & poisoning resistance
 
 The first-hand rule (§8.1) stops re-gossip amplification; the address-manager integration (§9.3)
@@ -668,6 +845,13 @@ The frozen, testable statements of version 1. An implementation conforms iff all
 | PEX-14 | The error envelope is `pex_error` with the §4.5 code table, on both bindings; errors are advisory. |
 | PEX-15 | The per-link `received` set is capped at `PEX_MAX_RECEIVED_PER_LINK` and the global `hints` map at `PEX_MAX_HINTS`, both with oldest-`last_seen` eviction on overflow; muting a direction immediately clears its `received` set and any `hints` it sources. |
 | PEX-16 | A `pex_error` code-3 back-off is applied only when the sender's own last data send on that link falls within the receiver's arrival-floor window of `now`, and at most once per (pre-doubling) effective interval — an unauthenticated code-3 flood cannot force an unbounded or immediate escalation to `PEX_MAX_INTERVAL`. |
+| PEX-17 | `pex_handshake` carries an OPTIONAL `payment` in exactly the §3.4 claim shape — never a bare address; the addition is additive and the wire `version` stays `1`, so a version-1 decoder that does not know the field ignores it and completes the handshake (§2, §4.2.1 rules 1, 11). |
+| PEX-18 | A handshake claim is the **sender's own**: it is verified against the link's mTLS `peer_id` (never a wire field) and the link's `network_id`, `SHA-256(spki) == peer_id` is recomputed by the PEX implementation itself, and a receiver never attaches a handshake claim to any entry but the sending peer's (§4.2.1 rules 1–3). |
+| PEX-19 | A claim that fails for any reason — caps, base64, `peer_id` mismatch, bad signature — is dropped while the handshake is processed exactly as if the field were absent: no `pex_error`, no strike, no mute, no change to phase / interval / flags (§4.2.1 rule 4). |
+| PEX-20 | A receiver with no verifier configured stores, exposes and advertises no claim, and runs PEX normally in both directions — fail-closed on payability, fail-open on reachability (§4.2.1 rule 5). |
+| PEX-21 | The PEX implementation itself verifies, stores (keyed by `peer_id`, at most one per peer) and attaches neighbour claims, so an embedder writes no carriage code; a verified claim takes precedence over an embedder-attached one, a failed claim never replaces a stored verified one, and storing a claim never creates or refreshes a first-hand entry (§4.2.1 rules 6, 9). |
+| PEX-22 | The §9.1 advertised-content fingerprint includes all three claim fields, so a claim that arrives, changes or is removed re-advertises its entry as an `added` update on every link already told it; a claim never appears in `dropped` (§4.2.1 rule 8, §9.1). |
+| PEX-23 | A stored claim outlives link teardown for as long as the peer stays in the first-hand set (up to `PEX_MAX_ENTRY_AGE`) and is discarded when it leaves — bounding the store by live links plus first-hand set, with no new constant and no new unauthenticated surface (§4.2.1 rules 7, 10, §11.3). |
 
 Cross-references: the L7 peer-network page (`docs.dig.net` → protocol → peer-network) defines the
 `peer_id`, the address/`Contact` shapes, RLY-001..RLY-007, and the framed-JSON convention this
@@ -709,6 +893,15 @@ to act on. Both integrations are thin adapters:
 5. Feed first-hand knowledge back: on every verified peer connect / address change, call
    `engine.upsert_known(entry)` (with the honest `via` + fresh `last_seen`); on disconnect/stale,
    `engine.remove_known(peer_id)`. On connection close, `engine.link_down(peer_id)`.
+6. Payment claims (§4.2.1) need **no carriage code**. Configure two things on the config once — the
+   node's own signed claim (only if the operator set a payout address) and an ECDSA P-256 signature
+   verifier for the key type `dig-tls` issues — and the engine puts the claim on every outgoing
+   handshake, verifies and stores each neighbour's, and attaches it whenever it advertises that
+   neighbour. Do NOT build a claim onto a `PeerEntry`, verify one, or copy one out of a handshake
+   yourself; a claim you attach by hand is superseded by the verified one the engine holds (§4.2.1
+   rule 6). A node with no verifier configured runs PEX normally and simply never learns a payee, and
+   a node with no claim configured sends handshakes without the field — both are complete conformance
+   states (§4.2.1 rules 5, 9). Read a payee only through `PeerEntry::verified_payment_address`.
 
 **dig-relay** (relay binding, §10.2):
 
@@ -723,3 +916,8 @@ to act on. Both integrations are thin adapters:
    data into the registry — discard it.
 4. Drive `engine.tick` on the relay's housekeeping timer; route per-link output to the matching
    WebSocket, scoped by `network_id` exactly like every other relay route.
+5. Payment claims: the §4.2.1 rules are per-link, so the relay MAY configure its own claim and a
+   verifier and they would apply to its registered links unchanged. It does not in this pass —
+   `dig-relay`'s own SPEC §4 pins introducer entries to `payment` absent — so leave both unset. A
+   node's handshake to the relay may still carry that node's claim; with no verifier configured the
+   relay stores nothing and advertises nothing (§4.2.1 rule 5), which is the intended behaviour here.

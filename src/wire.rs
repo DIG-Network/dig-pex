@@ -28,6 +28,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::caps::PEX_MAX_FRAME;
 use crate::entry::PeerEntry;
+use crate::payment::PaymentClaim;
 
 /// A PEX protocol message — one of the four `type`-tagged shapes (SPEC §4). The `type` tag and field
 /// names are the frozen wire contract.
@@ -48,6 +49,12 @@ pub enum PexMessage {
         /// The sender's own capability flags (optional; defaults to empty).
         #[serde(default)]
         flags: Vec<String>,
+        /// The sender's own signed payment claim (SPEC §4.2.1), added in crate `0.3.0`. Purely
+        /// additive: absent on the wire when unset, and a version-1 receiver that predates it
+        /// ignores it (`unknown_fields_ignored_on_receive` below). Governed entirely by §4.2.1 —
+        /// carriage only; verification/storage/precedence live in [`crate::PexEngine`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payment: Option<PaymentClaim>,
     },
     /// The first **data message** in a direction — a fuller, capped picture of the sender's
     /// first-hand known-peer set, so a fresh link warms up in one message (SPEC §4.3). Exactly one
@@ -158,6 +165,7 @@ mod tests {
             network_id: "mainnet".into(),
             interval: 60,
             flags: vec!["storage".into(), "holepunch".into()],
+            payment: None,
         };
         let s = m.to_json();
         assert!(s.contains("\"type\":\"pex_handshake\""));
@@ -165,6 +173,10 @@ mod tests {
         assert!(s.contains("\"network_id\":\"mainnet\""));
         assert!(s.contains("\"interval\":60"));
         assert!(s.contains("\"flags\":[\"storage\",\"holepunch\"]"));
+        assert!(
+            !s.contains("\"payment\""),
+            "an unset payment claim must be omitted entirely, not null (0.2.x compat)"
+        );
     }
 
     #[test]
@@ -210,6 +222,7 @@ mod tests {
                 network_id: "mainnet".into(),
                 interval: 60,
                 flags: vec!["storage".into()],
+                payment: None,
             },
             PexMessage::PexSnapshot {
                 peers: vec![sample_entry()],
@@ -276,5 +289,40 @@ mod tests {
     fn missing_required_field_is_error() {
         // A snapshot missing `peers` is a malformed message (SPEC §7.3), not an empty snapshot.
         assert!(PexMessage::from_json(r#"{"type":"pex_snapshot"}"#).is_err());
+    }
+
+    #[test]
+    fn handshake_json_with_payment_decodes_on_the_current_decoder() {
+        // SPEC §4.2.1 rule 11 / ACCEPTANCE (f): a `payment` claim on `pex_handshake` decodes fine —
+        // it is purely additive over the 0.2.x wire.
+        let s = r#"{"type":"pex_handshake","version":1,"network_id":"mainnet","interval":60,
+                    "payment":{"address":"xch1abc","spki":"c3Br","sig":"c2ln"}}"#;
+        let m = PexMessage::from_json(s).unwrap();
+        match m {
+            PexMessage::PexHandshake { payment, .. } => {
+                assert!(
+                    payment.is_some(),
+                    "a present payment field must decode to Some"
+                );
+            }
+            other => panic!("expected pex_handshake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handshake_without_payment_omits_the_key_entirely() {
+        // SPEC §4.2.1 rule 11: a 0.2.0 output has no `payment` key at all (not `"payment":null`),
+        // so a 0.2.x decoder — which has never heard of the field — sees byte-identical JSON.
+        let m = PexMessage::PexHandshake {
+            version: PEX_VERSION,
+            network_id: "mainnet".into(),
+            interval: 60,
+            flags: vec![],
+            payment: None,
+        };
+        assert_eq!(
+            m.to_json(),
+            r#"{"type":"pex_handshake","version":1,"network_id":"mainnet","interval":60,"flags":[]}"#
+        );
     }
 }
